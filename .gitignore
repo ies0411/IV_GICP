@@ -1,0 +1,9 @@
+docs/
+.venv/
+__pycache__/
+*.pyc
+output/
+CLAUDE.md
+.claude/
+build/
+tests/
