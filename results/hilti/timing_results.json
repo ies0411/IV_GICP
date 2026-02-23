@@ -1,0 +1,23 @@
+{
+  "IV-GICP": {
+    "mean_ms": 859.3115820529961,
+    "median_ms": 850.0120399985462,
+    "std_ms": 187.00454213439144,
+    "n_frames": 299,
+    "end_displacement_m": 30.048172183361977
+  },
+  "GICP-Baseline": {
+    "mean_ms": 784.6668715437681,
+    "median_ms": 645.8301690872759,
+    "std_ms": 516.497627925352,
+    "n_frames": 299,
+    "end_displacement_m": 13.052459728676054
+  },
+  "KISS-ICP": {
+    "mean_ms": 8.835396856726787,
+    "median_ms": 8.393538068048656,
+    "std_ms": 2.085644289999752,
+    "n_frames": 299,
+    "end_displacement_m": 32.78810893065321
+  }
+}

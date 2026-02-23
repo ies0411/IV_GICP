@@ -1,4 +1,4 @@
-docs/
+# docs/
 .venv/
 __pycache__/
 *.pyc
@@ -7,3 +7,4 @@ CLAUDE.md
 .claude/
 build/
 tests/
+thirdparty/
