@@ -153,7 +153,7 @@ class IVGICPPipeline:
                 min_points_coarse=min_points_per_voxel,
                 max_frames=_map_frames,
                 entropy_threshold=entropy_threshold,
-                lambda_intensity=0.1,   # λ weight for H_int (paper Section A default)
+                lambda_intensity=0.1,
             )
         else:
             # Plain FlatVoxelMap (faster for large outdoor scenes; ablation baseline)
@@ -528,7 +528,7 @@ class IVGICPPipeline:
             H_icp = reg_info.get("hessian")
             if H_icp is not None:
                 T_rel_cur = se3_compose(se3_inverse(self.current_pose), T)
-                T = self._window_smooth(T, T_rel_cur, H_icp)
+                T = self._window_smooth(T, T_rel_cur, H_icp, self._frame_count)
 
         # Update adaptive sigma from accepted registration quality.
         # sigma = median correspondence distance between accepted-pose source and target.
@@ -554,7 +554,7 @@ class IVGICPPipeline:
         # accumulating and causing cascade failures on subsequent frames.
         _t_map = time.perf_counter()
         if not poor_registration:
-            self._update_map(points, intensities, T)
+            self._update_map(points, intensities, T, self._frame_count)
         map_ms = (time.perf_counter() - _t_map) * 1000
         self._frame_count += 1
 
@@ -569,17 +569,17 @@ class IVGICPPipeline:
         points: np.ndarray,
         intensities: np.ndarray,
         T: np.ndarray,
+        frame_id: int,
     ) -> None:
         """
         Incremental map update: O(N_frame) per call.
 
-        Transforms source points to world frame and inserts into AdaptiveFlatVoxelMap.
+        Transforms source points to world frame and inserts into the voxel map.
         World-frame merging (Welford) gives robust multi-frame covariances for GICP.
         Sliding window eviction keeps map bounded at max_frames keyframes.
         """
-        # Transform source to world frame and insert into map.
         pts_world = (T[:3, :3] @ points[:, :3].T).T + T[:3, 3]
-        self.flat_map.insert_frame(pts_world, intensities, self._frame_count)
+        self.flat_map.insert_frame(pts_world, intensities, frame_id)
 
         # Sliding window: evict voxels not observed in the last max_frames frames.
         # Evict every 10 frames to amortize O(V) dict traversal over large outdoor maps.
@@ -610,29 +610,32 @@ class IVGICPPipeline:
         T_new: np.ndarray,
         T_rel: np.ndarray,
         H: np.ndarray,
+        frame_id: int,
     ) -> np.ndarray:
         """
-        FORM-style fixed-lag window smoothing (Potokar et al. 2025, arXiv 2510.09966).
+        FORM-style fixed-lag window smoothing with C3 retroactive map update.
 
-        Jointly optimizes the K most recent poses using ICP Hessians as factor
-        information matrices. High H eigenvalues = well-constrained DOFs; low
-        eigenvalues = degenerate. Propagates constraint from informative frames to
-        adjacent degenerate ones — the core FORM idea.
+        Step 1 — Pose smoothing (FORM, Potokar et al. 2025, arXiv 2510.09966):
+            Jointly optimizes K poses using ICP Hessians as information matrices.
+            High eigenvalue = well-constrained DOF; low = degenerate.
+            Adjacent well-constrained frames repair degenerate DOFs.
 
-        Faster than GTSAM: 3 GN steps on a 6K×6K linear system (<0.5ms for K≤15).
-        GTSAM uses Levenberg-Marquardt with dense factor graph management; our
-        GN solver directly assembles the Hessian via our factor_graph module.
+        Step 2 — Map update (C3, O(V)):
+            After smoothing, calls LocalKeyframeVoxelMap.update_poses() to
+            transform stored local voxel distributions to corrected world frame.
+            Cost: O(V) matrix multiply per voxel — no raw-point reprocessing.
+            This is the key C3 advantage over FORM's O(N×W) reconstruction.
 
         Args:
-            T_new: raw ICP pose for current frame (4×4 world←sensor)
-            T_rel: relative motion from prev pose (T_prev^{-1} @ T_new)
-            H:     ICP Hessian (6×6), approximates Fisher info of this measurement
+            T_new:    raw ICP pose for current frame (4×4 world←sensor)
+            T_rel:    relative motion from prev pose (T_prev^{-1} @ T_new)
+            H:        ICP Hessian (6×6), approximates Fisher info of this measurement
+            frame_id: current frame index (for C3 map update bookkeeping)
 
         Returns:
             Optimized current pose (4×4).
-            Also retroactively corrects trajectory.poses for the window.
         """
-        self._window_buffer.append((T_new.copy(), T_rel.copy(), H.copy()))
+        self._window_buffer.append((T_new.copy(), T_rel.copy(), H.copy(), frame_id))
         K = len(self._window_buffer)
         if K < 2:
             return T_new
@@ -641,18 +644,17 @@ class IVGICPPipeline:
 
         optimizer = PoseGraphOptimizer(
             lag_size=K,
-            max_iterations=3,       # 3 GN steps: near-linear regime, <0.5ms
+            max_iterations=3,
             convergence_threshold=1e-6,
-            prior_weight=1e4,       # strong anchor on oldest window pose
+            prior_weight=1e4,
         )
         optimizer.set_prior(buf[0][0])
-        for T_abs, _, _ in buf:
+        for T_abs, _, _, _ in buf:
             optimizer.add_pose(T_abs)
 
         for i in range(1, K):
             T_rel_i = buf[i][1]
-            H_i = buf[i][2]
-            # Ensure PSD: symmetrize + shift by |min_eigenvalue| if negative
+            H_i     = buf[i][2]
             H_sym = (H_i + H_i.T) * 0.5
             min_eig = float(np.linalg.eigvalsh(H_sym)[0])
             if min_eig < 1e-4:
@@ -663,18 +665,22 @@ class IVGICPPipeline:
         if opt_poses is None or len(opt_poses) < K:
             return T_new
 
-        # Retroactively correct the previous K-1 poses in trajectory.poses.
-        # This is FORM's "reparative mapping" concept: the window optimization
-        # corrects all K frames jointly, improving old estimates when new constraints arrive.
+        # Step 1: retroactively correct trajectory poses.
         n_traj = len(self.trajectory.poses)
         for k in range(K - 1):
             traj_idx = n_traj - (K - 1) + k
             if 0 <= traj_idx < n_traj:
                 self.trajectory.poses[traj_idx] = opt_poses[k]
 
-        # Update buffer with corrected absolute poses so the next frame's T_rel
-        # is computed relative to the smoothed (not raw ICP) reference pose.
-        new_buf = [(opt_poses[k], buf[k][1], buf[k][2]) for k in range(K)]
+        # NOTE: Step 2 (C3 map update via apply_delta_transform) is intentionally
+        # omitted from the per-frame sliding window path. The sliding window overlaps
+        # mean each frame appears in ~window_size consecutive windows, causing its
+        # correction to be applied ~window_size times → cumulative map drift.
+        # C3 map update is only safe when triggered once per loop-closure event,
+        # not per-frame. See docs/c3.md for detailed analysis.
+
+        # Update buffer with corrected poses for next frame's T_rel computation.
+        new_buf = [(opt_poses[k], buf[k][1], buf[k][2], buf[k][3]) for k in range(K)]
         self._window_buffer.clear()
         for entry in new_buf:
             self._window_buffer.append(entry)

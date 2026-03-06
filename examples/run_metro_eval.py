@@ -88,7 +88,10 @@ def read_metro_frames(bag_path: Path, max_frames: int = None, max_range: float =
 # ── GT loader (same format as Urban tunnel) ───────────────────────────────────
 
 def load_gt(gt_path: Path):
-    """Load GT: timestamp x_utm y_utm z qx qy qz qw → local SE(3) poses."""
+    """Load GT: timestamp x_utm y_utm z qx qy qz qw → local SE(3) poses.
+    Metro tunnel GT has zero quaternions (position-only from RTK-GPS);
+    replace with identity rotation so ATE evaluates translation only.
+    """
     from scipy.spatial.transform import Rotation
 
     data = np.loadtxt(gt_path)
@@ -99,7 +102,11 @@ def load_gt(gt_path: Path):
     T0_inv = None
     poses  = []
     for i in range(len(timestamps)):
-        R = Rotation.from_quat(quats[i]).as_matrix()
+        q = quats[i]
+        if np.linalg.norm(q) < 1e-6:
+            R = np.eye(3)  # position-only GT: use identity rotation
+        else:
+            R = Rotation.from_quat(q).as_matrix()
         T = np.eye(4); T[:3, :3] = R; T[:3, 3] = txyz[i]
         if T0_inv is None:
             T0_inv = np.linalg.inv(T)
@@ -144,7 +151,7 @@ def compose_poses(rel_list):
 
 # ── Method runners (same as run_geode_eval.py) ────────────────────────────────
 
-def run_iv_gicp(frames, device="cuda"):
+def run_iv_gicp(frames, device="cuda", window_size=1):
     import sys; sys.path.insert(0, str(Path(__file__).parent.parent))
     from iv_gicp.pipeline import IVGICPPipeline
 
@@ -155,11 +162,12 @@ def run_iv_gicp(frames, device="cuda"):
         max_correspondence_distance=1.5,
         initial_threshold=1.5,
         max_iterations=20,
+        window_size=window_size,
         device=device,
         use_distribution_propagation=False,
     )
     abs_poses, times = [np.eye(4)], []
-    print(f"\n[IV-GICP] {len(frames)} frames  device={device}  α=0.5")
+    print(f"\n[IV-GICP] {len(frames)} frames  device={device}  α=0.5  window={window_size}")
     for i, (ts, pts) in enumerate(frames):
         t0 = time.perf_counter()
         result = pipeline.process_frame(pts[:, :3], pts[:, 3], timestamp=ts)
@@ -256,6 +264,7 @@ def main():
     parser.add_argument("--device",    default="auto")
     parser.add_argument("--kiss-only", action="store_true")
     parser.add_argument("--no-gicp-baseline", action="store_true")
+    parser.add_argument("--window-size", type=int, default=1)
     args = parser.parse_args()
 
     if args.device == "auto":
@@ -302,7 +311,7 @@ def main():
 
     if not args.kiss_only:
         # ── IV-GICP ───────────────────────────────────────────────────────────
-        iv_rel, iv_t = run_iv_gicp(frames, device=device)
+        iv_rel, iv_t = run_iv_gicp(frames, device=device, window_size=args.window_size)
         iv_poses = compose_poses(iv_rel)
         save_tum(iv_poses, timestamps, out / "iv_gicp.tum")
         pl, ed = traj_stats(iv_poses)

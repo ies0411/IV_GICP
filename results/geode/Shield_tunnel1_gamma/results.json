@@ -1,0 +1,30 @@
+{
+  "meta": {
+    "seq": "Shield_tunnel1_gamma",
+    "bag": "/home/km/data/GEODE/sensor_data/Metro_tunnel/Shield_tunnel1_gamma/Shield_tunnel1_gamma.bag",
+    "n_frames": 300,
+    "duration_s": 29.899728775024414,
+    "avg_pts_per_frame": 23683.926666666666,
+    "gt_path_m": 28.345782528227062,
+    "gt_end_disp_m": 28.130997794959267
+  },
+  "methods": {
+    "KISS-ICP": {
+      "mean_ms": 12.61149144343411,
+      "hz": 79.29276283342583,
+      "path_length_m": 35.68612910963182,
+      "end_displacement_m": 0.7392177365687996,
+      "ate_rmse_m": 9.111549191225896,
+      "n_frames": 300
+    },
+    "IV-GICP": {
+      "mean_ms": 702.3268682184477,
+      "hz": 1.4238384508008965,
+      "path_length_m": 20.12666938585231,
+      "end_displacement_m": 5.851241674018738,
+      "ate_rmse_m": 6.9910319502195994,
+      "n_frames": 300,
+      "device": "cuda"
+    }
+  }
+}

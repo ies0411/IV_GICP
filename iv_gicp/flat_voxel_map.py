@@ -209,6 +209,29 @@ class FlatVoxelMap:
             self._leaves = None
         return len(old_keys)
 
+    def apply_delta_transform(self, R: np.ndarray, t: np.ndarray) -> None:
+        """
+        C3: O(V) retroactive map correction after window pose smoothing.
+
+        Applies SE(3) delta (R, t) to every voxel in-place:
+            μ_new  = R @ μ_old + t
+            M2_new = R @ M2_old @ R^T   (covariance rotation — Theorem 2)
+
+        Safe for window-smoothing corrections where |ΔT| is small (sub-cm).
+        Larger corrections accumulate floating-point error in M2 rotation,
+        but for a K=10 window the corrections are typically <1mm so this is exact.
+        """
+        if not self._voxels:
+            return
+        means = np.array([s.mean for s in self._voxels.values()])       # (V, 3)
+        M2s   = np.array([s.M2   for s in self._voxels.values()])       # (V, 3, 3)
+        new_means = (R @ means.T).T + t                                  # (V, 3)
+        new_M2    = np.einsum('ij,kjl,ml->kim', R, M2s, R)              # (V, 3, 3)
+        for (s, nm, nM) in zip(self._voxels.values(), new_means, new_M2):
+            s.mean = nm
+            s.M2   = nM
+        self._leaves = None  # invalidate cache
+
     @property
     def leaves(self) -> List[FlatLeaf]:
         """
@@ -310,6 +333,12 @@ class AdaptiveFlatVoxelMap:
     def evict_before(self, frame_id: int) -> None:
         self._coarse.evict_before(frame_id)
         self._fine.evict_before(frame_id)
+        self._leaves_cache = None
+
+    def apply_delta_transform(self, R: np.ndarray, t: np.ndarray) -> None:
+        """C3: delegate to both coarse and fine maps."""
+        self._coarse.apply_delta_transform(R, t)
+        self._fine.apply_delta_transform(R, t)
         self._leaves_cache = None
 
     @property
