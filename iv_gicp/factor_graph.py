@@ -77,9 +77,17 @@ class PoseGraphOptimizer:
         self.poses.append(np.array(T, dtype=float))
         return idx
 
-    def add_odometry_factor(self, i: int, j: int, T_rel: np.ndarray) -> None:
-        """Add odometry factor: T_rel is pose of j in frame i (T_i^{-1} @ T_j)."""
-        omega = np.eye(6) * self.odometry_weight
+    def add_odometry_factor(
+        self, i: int, j: int, T_rel: np.ndarray,
+        omega: Optional[np.ndarray] = None,
+    ) -> None:
+        """Add odometry factor: T_rel is pose of j in frame i (T_i^{-1} @ T_j).
+
+        omega: 6×6 information matrix (default: identity × odometry_weight).
+               Pass the ICP Hessian for FORM-style information-weighted smoothing.
+        """
+        if omega is None:
+            omega = np.eye(6) * self.odometry_weight
         self.odom_factors.append(OdometryFactor(i=i, j=j, T_meas=T_rel, omega=omega))
 
     def set_prior(self, T: np.ndarray) -> None:

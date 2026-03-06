@@ -79,9 +79,10 @@ def transform_point(T: np.ndarray, p: np.ndarray) -> np.ndarray:
 class Voxel4D:
     """4D voxel: geometry + intensity, with precomputed intensity gradient."""
     mean: np.ndarray           # (4,) [x, y, z, α·I]
-    cov: np.ndarray            # (4,4) combined covariance (from information form)
     precision: np.ndarray = field(default_factory=lambda: np.eye(4))
     # (4,4) precomputed C^{-1} (avoids repeated pinv in GN loop)
+    cov: Optional[np.ndarray] = None
+    # (4,4) combined covariance — optional, unused in GN hot-path (only precision used)
     intensity_gradient: np.ndarray = field(default_factory=lambda: np.zeros(3))
     # (3,) ∇μ_I at voxel center, estimated from K-NN finite differences
 
@@ -175,10 +176,12 @@ class IVGICP:
         self,
         alpha: float = 0.1,                      # intensity scaling (unit alignment: ~range/max_I)
         max_correspondence_distance: float = 2.0,
-        max_iterations: int = 32,
-        convergence_threshold: float = 1e-6,
+        max_iterations: int = 100,
+        convergence_threshold: float = 1e-4,
         min_voxel_size: float = 0.5,             # ℓ_v for σ_I² formula
         n_intensity_grad_neighbors: int = 8,     # K for gradient estimation
+        huber_delta: float = 0.0,                # Huber threshold (0 = disabled)
+        source_sigma: float = 0.0,               # source point uncertainty [m]; 0 = target-only Omega
         device: str = "auto",                    # 'auto'|'cuda'|'cpu'|None
     ):
         self.alpha = alpha
@@ -187,6 +190,8 @@ class IVGICP:
         self.conv_thresh = convergence_threshold
         self.min_voxel_size = min_voxel_size
         self.n_grad_nbrs = n_intensity_grad_neighbors
+        self.huber_delta = huber_delta
+        self.source_sigma = source_sigma
         self._device = get_device(device)
         self._gpu_cache = TargetGPUCache(self._device)
 
@@ -217,32 +222,28 @@ class IVGICP:
         # Batch query (one call is faster than n individual queries)
         _, all_nbr_idx = tree.query(means_arr, k=k_query)  # (n, k_query)
 
-        # Remove self from each row and keep only n_grad_nbrs neighbors
-        # Build clean (n, K) index array for batch computation
+        # Vectorized neighbor cleanup: index 0 is always self (querying cloud against itself).
+        # Skip column 0, take next K columns; pad/clamp if fewer than K exist.
         K = self.n_grad_nbrs
-        clean_idx = np.zeros((n, K), dtype=np.intp)
-        valid_mask = np.zeros(n, dtype=bool)
-        for i in range(n):
-            nbrs = all_nbr_idx[i]
-            nbrs = nbrs[nbrs != i][:K]
-            if len(nbrs) >= 3:
-                # Pad with last neighbor if fewer than K
-                if len(nbrs) < K:
-                    nbrs = np.pad(nbrs, (0, K - len(nbrs)), mode='edge')
-                clean_idx[i] = nbrs
-                valid_mask[i] = True
+        clean_idx = all_nbr_idx[:, 1:]                     # (n, k_query-1) — drop self
+        k_got = clean_idx.shape[1]
+        if k_got < K:
+            # Pad by repeating last column
+            pad = np.repeat(clean_idx[:, -1:], K - k_got, axis=1)
+            clean_idx = np.concatenate([clean_idx, pad], axis=1)
+        else:
+            clean_idx = clean_idx[:, :K]
+        clean_idx = np.minimum(clean_idx, n - 1).astype(np.intp)  # clamp out-of-bounds
 
-        if not np.any(valid_mask):
+        if clean_idx.shape[1] < 3:
             return
 
-        # GPU batch lstsq for all valid voxels at once
-        valid_i = np.where(valid_mask)[0]
         grads = batch_intensity_gradients(
-            means_arr, intensities, clean_idx[valid_i], self._device
-        )  # (n_valid, 3)
+            means_arr, intensities, clean_idx, self._device
+        )  # (n, 3)
 
-        for out_i, voxel_i in enumerate(valid_i):
-            voxels_4d[voxel_i].intensity_gradient = grads[out_i]
+        for i, v in enumerate(voxels_4d):
+            v.intensity_gradient = grads[i]
 
     def _build_target_map(
         self,
@@ -252,67 +253,82 @@ class IVGICP:
         """
         Build 4D voxel map from target point cloud.
         Returns: (voxel_centers: (M,3), voxels: List[Voxel4D], KDTree)
+
+        Fully vectorized: replaces O(N) Python point loop with numpy sort+unique.
+        Complexity: O(N log N) for sort, all stats via numpy scatter-add.
+        For N=47k points → ~3-8ms vs ~200ms for the old Python loop.
         """
         vs = self.min_voxel_size
-        voxel_keys: dict = {}
+        pts = target_points[:, :3]
+        ints = target_intensities
 
-        for i in range(len(target_points)):
-            k = tuple((target_points[i, :3] / vs).astype(int))
-            if k not in voxel_keys:
-                voxel_keys[k] = []
-            voxel_keys[k].append(i)
+        # ── Step 1: Vectorized voxel assignment ──────────────────────────────
+        # Map each point to integer voxel key, sort for contiguous grouping.
+        keys_arr = np.floor(pts / vs).astype(np.int64)  # (N, 3)
+        sort_idx = np.lexsort(keys_arr.T[::-1])          # sort by (x, y, z)
+        keys_s   = keys_arr[sort_idx]                    # (N, 3) sorted keys
+        pts_s    = pts[sort_idx]                         # (N, 3)
+        ints_s   = ints[sort_idx]                        # (N,)
 
-        # Collect per-voxel data before GPU batch ops
-        voxel_data = []  # list of (mean_xyz, cov_3d, mean_i, var_i)
-        for indices in voxel_keys.values():
-            pts = target_points[indices, :3]
-            ints = target_intensities[indices]
-            mean_xyz = np.mean(pts, axis=0)
-            if len(pts) > 1:
-                centered = pts - mean_xyz
-                cov_3d = (centered.T @ centered) / (len(pts) - 1)
-                if cov_3d.ndim < 2 or cov_3d.shape != (3, 3):
-                    cov_3d = np.eye(3) * 1e-4
-            else:
-                cov_3d = np.eye(3) * 1e-4
-            cov_3d = cov_3d + 1e-6 * np.eye(3)
-            mean_i = float(np.mean(ints))
-            var_i = float(np.var(ints)) if len(ints) > 1 else 0.0
-            voxel_data.append((mean_xyz, cov_3d, mean_i, var_i))
+        _, inv_idx, counts = np.unique(
+            keys_s, axis=0, return_inverse=True, return_counts=True
+        )  # inv_idx: (N,), counts: (V,) — inv_idx is monotone since keys_s is sorted
+        nv = len(counts)
 
-        nv = len(voxel_data)
-        covs_arr  = np.array([d[1] for d in voxel_data])   # (nv, 3, 3)
-        var_i_arr = np.array([d[3] for d in voxel_data])   # (nv,)
-        means_arr_4d = np.array([
-            [d[0][0], d[0][1], d[0][2], self.alpha * d[2]] for d in voxel_data
-        ])   # (nv, 4)
+        # Group boundaries for reduceat (fast: contiguous vs scatter)
+        # inv_idx is sorted [0,0,...,1,1,...] so boundaries are change-points.
+        bdry = np.concatenate([[0], np.where(np.diff(inv_idx))[0] + 1])  # (V,)
 
-        # Batch build all precision matrices (GPU or numpy)
+        # ── Step 2: Vectorized statistics via reduceat (cache-friendly) ───────
+        # reduceat processes contiguous sorted groups — ~10x faster than add.at
+        means = np.add.reduceat(pts_s, bdry) / counts[:, np.newaxis]     # (V, 3)
+
+        centered = pts_s - means[inv_idx]                                 # (N, 3)
+        outer    = (centered[:, :, np.newaxis] * centered[:, np.newaxis, :])  # (N,3,3)
+        M2 = np.add.reduceat(outer.reshape(-1, 9), bdry).reshape(nv, 3, 3)   # (V,3,3)
+
+        mean_i = np.add.reduceat(ints_s, bdry) / counts                  # (V,)
+        ci     = ints_s - mean_i[inv_idx]
+        var_i  = np.add.reduceat(ci ** 2, bdry)                           # (V,)
+
+        n_safe = np.maximum(counts - 1, 1)
+        covs  = M2 / n_safe[:, np.newaxis, np.newaxis]  # (V, 3, 3)
+        covs += 1e-6 * np.eye(3)[np.newaxis]             # regularize
+        var_i /= n_safe                                  # (V,)
+
+        # ── Step 3: Filter to voxels with ≥ 1 point ──────────────────────────
+        # Accept singletons: cov=1e-6·I (point-to-point ICP constraint).
+        # Requiring ≥ 2 leaves only ~3-4 voxels for small clouds (e.g. 300 pts
+        # with 0.5m voxels), causing GN divergence due to degenerate matches.
+        valid    = counts >= 1
+        means_v  = means[valid]    # (V', 3)
+        covs_v   = covs[valid]     # (V', 3, 3)
+        mean_i_v = mean_i[valid]   # (V',)
+        var_i_v  = var_i[valid]    # (V',)
+        nv_v = int(np.sum(valid))
+
+        if nv_v == 0:
+            return np.zeros((0, 3)), [], FastKDTree(np.zeros((1, 3)))
+
+        # ── Step 4: Batch GPU precision matrices ──────────────────────────────
         precisions = batch_precision_matrices(
-            covs_arr, var_i_arr, self.min_voxel_size, self.alpha,
+            covs_v, var_i_v, self.min_voxel_size, self.alpha,
+            source_sigma=self.source_sigma,
             device=self._device,
-        )   # (nv, 4, 4)
+        )  # (V', 4, 4)
 
-        voxels_4d: List[Voxel4D] = []
-        means: List[np.ndarray] = []
-        for i, d in enumerate(voxel_data):
-            mean_xyz, cov_3d, mean_i, var_i = d
-            C_combined = build_combined_covariance(cov_3d, var_i, self.min_voxel_size, self.alpha)
-            voxels_4d.append(Voxel4D(
-                mean=means_arr_4d[i],
-                cov=C_combined,
-                precision=precisions[i],
-            ))
-            means.append(mean_xyz)
+        # ── Step 5: Build Voxel4D list (V' iterations, not N) ─────────────────
+        # Note: Voxel4D.cov unused in GN hot-path (only .precision and .mean used).
+        means_4d = np.column_stack([means_v, self.alpha * mean_i_v])  # (V', 4)
+        voxels_4d = [
+            Voxel4D(mean=means_4d[i], precision=precisions[i])
+            for i in range(nv_v)
+        ]
 
-        means_arr = np.array(means)
-        tree = FastKDTree(means_arr)
+        tree = FastKDTree(means_v)
+        self._compute_intensity_gradients(means_v, voxels_4d, tree)
 
-        # Precompute intensity gradients ∇μ_I at each voxel center
-        # (used in intensity Jacobian: J[3,:] = -α · ∇μ_I^T · J_xyz)
-        self._compute_intensity_gradients(means_arr, voxels_4d, tree)
-
-        return means_arr, voxels_4d, tree
+        return means_v, voxels_4d, tree
 
     def _precompute_target_arrays(
         self,
@@ -344,6 +360,7 @@ class IVGICP:
         target_grads: np.ndarray,
         tree_t: cKDTree,
         T: np.ndarray,
+        max_corr_dist: Optional[float] = None,
     ) -> Tuple[np.ndarray, dict]:
         """
         Vectorized Gauss-Newton optimization for geo-photometric registration.
@@ -368,8 +385,10 @@ class IVGICP:
             T: (4, 4) optimized pose
             info: dict with convergence diagnostics
         """
+        corr_dist = max_corr_dist if max_corr_dist is not None else self.max_corr_dist
         n_target = len(target_means_4d)
         info = {"iterations": 0, "n_correspondences": 0, "converged": False}
+        H = None  # Hessian from last GN iteration (None if no correspondences found)
 
         for iteration in range(self.max_iter):
             R_cur = T[:3, :3]
@@ -380,11 +399,11 @@ class IVGICP:
 
             # 2. Batch KNN query
             dists, indices = tree_t.query(
-                src_transformed, k=1, distance_upper_bound=self.max_corr_dist
+                src_transformed, k=1, distance_upper_bound=corr_dist
             )
 
             # 3. Valid correspondence mask
-            valid = (indices < n_target) & (dists <= self.max_corr_dist)
+            valid = (indices < n_target) & (dists <= corr_dist)
             valid_idx = np.where(valid)[0]
             n_valid = len(valid_idx)
             if n_valid < 6:
@@ -402,15 +421,39 @@ class IVGICP:
             # target arrays gathered from GPU cache by correspondence indices
             t_means_g, t_prec_g, t_grad_g = self._gpu_cache.gather(tidx)
 
+            # 8. Huber robust kernel: per-point downweighting of outlier correspondences.
+            # w_i = 1 if dist_i < delta (inlier), delta/dist_i otherwise (outlier).
+            # Passed into gn_hessian_gradient for exact per-point reweighting:
+            #   H = Σ w_i * J_i^T Ω_i J_i,  b = Σ w_i * J_i^T Ω_i d_i
+            if self.huber_delta > 0 and n_valid > 0:
+                huber_d = dists[valid_idx]
+                weights = np.where(huber_d < self.huber_delta,
+                                   np.ones(n_valid),
+                                   self.huber_delta / (huber_d + 1e-9))
+            else:
+                weights = None
+
             H, b = gn_hessian_gradient(
                 src_trans_valid, src_int_valid,
                 t_means_g, t_prec_g, t_grad_g,
                 R_cur, self.alpha, self._device,
+                weights=weights,
             )
 
-            # 8. Solve with LM damping: δ = -(H + λI)^{-1} b
+            # 9. Solve: δ = -(H + λI)^{-1} b  with capped Marquardt damping.
+            #
+            # Problem with uncapped λ = 1e-4 × max_diag(H):
+            #   KITTI outdoor: Ω_zz from ground voxels → max_diag(H) ~ 1e9,
+            #   λ = 1e5.  Forward-direction H_xx ~ 5000 → step ≈ 5% GN.
+            #   100 iters × 5% → 63% convergence only → significant residual drift.
+            #
+            # Fix: cap λ at 100 (near-GN for typical H_ii >> 100):
+            #   H_xx=5000 → step = 98% GN  → converges in 2-3 iters  ✓
+            #   H_zz=1e9  → step ≈ 100% GN → converges in 1 iter      ✓
+            #   H_ii→0    → step bounded at b_ii/100                   ✓ (degenerate safe)
             try:
-                delta = np.linalg.solve(H + 1e-6 * np.eye(6), -b)
+                lm_lambda = float(np.clip(1e-4 * np.max(np.abs(np.diag(H))), 1e-6, 100.0))
+                delta = np.linalg.solve(H + lm_lambda * np.eye(6), -b)
             except np.linalg.LinAlgError:
                 break
 
@@ -426,6 +469,11 @@ class IVGICP:
                 info["converged"] = True
                 break
 
+        # Store the final Hessian for FORM-style window smoothing.
+        # H approximates the Fisher information of the pose measurement:
+        # high eigenvalues = well-constrained DOFs, low = degenerate DOFs.
+        if H is not None:
+            info["hessian"] = H
         return T, info
 
     def register(
@@ -479,7 +527,8 @@ class IVGICP:
         target_means_3d: np.ndarray,
         target_tree: cKDTree,
         init_pose: Optional[np.ndarray] = None,
-    ) -> np.ndarray:
+        max_corr_dist: Optional[float] = None,
+    ) -> Tuple[np.ndarray, dict]:
         """
         Register source to a pre-built voxel map (from AdaptiveVoxelMap).
 
@@ -493,12 +542,17 @@ class IVGICP:
             target_means_3d: (M, 3) voxel centers (for KDTree)
             target_tree: pre-built KDTree on target_means_3d
             init_pose: initial pose estimate
+            max_corr_dist: override for correspondence distance (adaptive threshold)
+
+        Returns:
+            (T, info): optimized 4×4 pose and convergence diagnostics dict
         """
         target_means_4d, target_precisions, target_grads = self._precompute_target_arrays(target_voxels)
         T = np.eye(4) if init_pose is None else np.array(init_pose, dtype=float)
-        T, _ = self._gauss_newton_vectorized(
+        T, info = self._gauss_newton_vectorized(
             source_points[:, :3], source_intensities,
             target_means_3d, target_means_4d, target_precisions, target_grads,
             target_tree, T,
+            max_corr_dist=max_corr_dist,
         )
-        return T
+        return T, info

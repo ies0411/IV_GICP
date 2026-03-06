@@ -1,0 +1,32 @@
+{
+  "meta": {
+    "seq": "Urban_Tunnel01",
+    "bag": "/home/km/data/GEODE/sensor_data/Urban_tunnel/Urban_Tunnel01/Urban_Tunnel01.bag",
+    "n_frames": 500,
+    "duration_s": 49.89592409133911,
+    "avg_pts_per_frame": 18647.694,
+    "gt_path_m": 335.65927837997873,
+    "gt_end_disp_m": 303.7785580354149
+  },
+  "methods": {
+    "KISS-ICP": {
+      "mean_ms": 4.044027057942003,
+      "hz": 247.27826635979483,
+      "path_length_m": 328.1520928291585,
+      "end_displacement_m": 301.1530978494884,
+      "ate_rmse_m": 3.22530582990255,
+      "n_frames": 500
+    },
+    "IV-GICP": {
+      "mean_ms": 114.54500944376036,
+      "hz": 8.730192654015038,
+      "reg_ms": 60.41649808194526,
+      "map_ms": 49.62489619209078,
+      "path_length_m": 326.65744659773327,
+      "end_displacement_m": 300.4973331913555,
+      "ate_rmse_m": 4.063485059442956,
+      "n_frames": 500,
+      "device": "cuda"
+    }
+  }
+}

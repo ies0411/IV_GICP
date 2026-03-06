@@ -18,7 +18,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import numpy as np
 from iv_gicp import IVGICPPipeline
-from iv_gicp.kitti_loader import load_kitti_sequence
+from iv_gicp.kitti_loader import load_kitti_sequence, load_kitti_odometry_sequence
 from iv_gicp.metrics import compute_ate, compute_rpe, compute_rpe_kitti
 
 
@@ -33,15 +33,19 @@ def run_kiss_icp(frames_xyz, poses_gt):
     config = KISSConfig()
     config.data.max_range = 80.0
     config.data.min_range = 2.0
-    config.mapping.voxel_size = 1.0  # must be set; KissICP requires explicit voxel_size
+    config.data.deskew = False  # no IMU/timestamps → deskew=True would produce NaN
+    config.mapping.voxel_size = 1.0
     kiss = KissICP(config=config)
 
     poses = []
     frame_times = []
     for pts in frames_xyz:
+        ranges = np.linalg.norm(pts, axis=1)
+        mask = (ranges > 2.0) & (ranges < 80.0) & np.isfinite(ranges)
+        pts_f = pts[mask].astype(np.float64)
         t0 = time.time()
-        timestamps = np.zeros(len(pts))
-        kiss.register_frame(pts, timestamps)
+        timestamps = np.linspace(0, 1, len(pts_f))
+        kiss.register_frame(pts_f, timestamps)
         frame_times.append(time.time() - t0)
         poses.append(kiss.last_pose.copy())
 
@@ -162,6 +166,9 @@ def write_eval_md(results, data_path, n_frames, out_path):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--data", default="data/kitti/sample")
+    parser.add_argument("--format", choices=["raw", "odometry"], default="raw",
+                        help="KITTI format (raw: velodyne_points+oxts, odometry: sequences+poses)")
+    parser.add_argument("--seq", default="00", help="Sequence ID for odometry format")
     parser.add_argument("--max-frames", type=int, default=None)
     parser.add_argument("--downsample", type=int, default=5)
     parser.add_argument("-o", "--output", default="output/eval")
@@ -172,20 +179,26 @@ def main():
         print(f"Error: {data_path} not found")
         sys.exit(1)
 
-    print(f"Loading KITTI from {data_path} ...")
-    frames_xyzI, poses_gt = load_kitti_sequence(
-        str(data_path), args.max_frames, downsample=args.downsample
-    )
+    print(f"Loading KITTI ({args.format}) from {data_path} ...")
+    if args.format == "odometry":
+        frames_xyzI, poses_gt = load_kitti_odometry_sequence(
+            str(data_path), args.seq, args.max_frames, downsample=args.downsample
+        )
+    else:
+        frames_xyzI, poses_gt = load_kitti_sequence(
+            str(data_path), args.max_frames, downsample=args.downsample
+        )
     frames_xyz = [f[:, :3] for f in frames_xyzI]
     n = len(frames_xyzI)
     print(f"  {n} frames loaded\n")
 
     common = dict(
-        voxel_size=1.0,
-        max_correspondence_distance=5.0,
+        voxel_size=0.5,                    # 1.0 → 0.5: finer map for better geometric constraint
+        max_correspondence_distance=1.5,   # 2.0 → 1.5: tighter to reduce false matches
+        initial_threshold=0.5,             # < max_corr_dist → sigma tracking activates properly
         max_range=80.0,
         min_range=2.0,
-        source_voxel_size=0.3,
+        source_voxel_size=0.3,             # centroid downsample: stable representative pts
         max_map_points=200_000,
     )
 

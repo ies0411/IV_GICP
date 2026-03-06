@@ -1,0 +1,38 @@
+{
+  "seq": "05",
+  "n_frames": 2000,
+  "methods": {
+    "KISS-ICP": {
+      "ate_rmse": 1.645761100404467,
+      "ate_mean": 1.440368177629513,
+      "kitti_t_err": 76.68672137758412,
+      "mean_ms": 104.84243972739205,
+      "n_frames": 2000,
+      "device": "cpu"
+    },
+    "GICP-Baseline": {
+      "ate_rmse": 1.804865712052844,
+      "ate_mean": 1.5393736893654093,
+      "kitti_t_err": 76.6309812710134,
+      "mean_ms": 416.2043278313346,
+      "n_frames": 2000,
+      "device": "cuda"
+    },
+    "IV-GICP": {
+      "ate_rmse": 1.81583832559755,
+      "ate_mean": 1.5343786097350471,
+      "kitti_t_err": 76.6182678101092,
+      "mean_ms": 419.1907031490482,
+      "n_frames": 2000,
+      "device": "cuda"
+    },
+    "GenZ-ICP": {
+      "ate_rmse": 1.1051804828619904,
+      "ate_mean": 1.0028746974325258,
+      "kitti_t_err": 76.65234986887488,
+      "mean_ms": NaN,
+      "n_frames": 2000,
+      "device": "cpu"
+    }
+  }
+}

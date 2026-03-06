@@ -115,6 +115,9 @@ def batch_precision_matrices(
     voxel_sizes: Union[np.ndarray, float],  # (n,) or scalar effective voxel sizes
     alpha: float,
     epsilon: float = 1e-6,
+    source_sigma: float = 0.0,   # source point position uncertainty [m]
+    n_counts: Optional[np.ndarray] = None,  # (n,) point counts per voxel
+    count_reg_scale: float = 2.0,  # prior stddev [m] for count-weighted regularization
     device=None,
 ) -> np.ndarray:                  # (n, 4, 4) precision matrices C^{-1}
     """
@@ -129,9 +132,15 @@ def batch_precision_matrices(
       Omega (n, 4, 4) block-diagonal information matrix
       C_inv = torch.linalg.inv(Omega^{-1})  ← stable via information form
 
-    Information form: Omega = diag(Sigma_geo^{-1}, omega_I)
-      where omega_I = alpha² / (var_I / vsize² + eps_var)
-    This is block-diagonal so inversion is exact and numerically stable.
+    Information form: Omega = diag(Sigma_combined^{-1}, omega_I)
+      where Sigma_combined = Sigma_geo + source_sigma^2 * I  (standard GICP)
+            omega_I = alpha² / (var_I / vsize² + eps_var)
+
+    source_sigma > 0 adds a source-point noise floor to the target covariance,
+    following the standard GICP combined covariance formulation (Segal 2009).
+    This naturally bounds the precision matrices, preventing extreme anisotropy
+    from degenerate voxels (e.g. flat ground planes: Omega_zz → 1/source_sigma²
+    instead of 1/eps ≈ 1e6), which stabilizes the Gauss-Newton Hessian.
     """
     n = len(covs_3d)
     eps_psd = 1e-6
@@ -143,9 +152,20 @@ def batch_precision_matrices(
     # Build (n, 4, 4) information matrix Omega = diag(Omega_geo, omega_I)
     Omega = np.zeros((n, 4, 4), dtype=np.float64)
 
-    # Geometric block: Omega_geo = (Sigma_geo + eps I)^{-1}
-    # Regularize first, then invert geometrically below
+    # Geometric block: Omega_geo = (Sigma_geo + eps_psd*I + source_sigma^2*I + count_reg)^{-1}
+    # Combined covariance (standard GICP: Sigma_source + Sigma_target).
+    # source_sigma adds a noise floor that bounds Omega_geo eigenvalues to ≤ 1/source_sigma².
     Sigma_reg = covs_3d + eps_psd * np.eye(3)[np.newaxis]   # (n, 3, 3)
+    if source_sigma > 0.0:
+        Sigma_reg = Sigma_reg + (source_sigma ** 2) * np.eye(3)[np.newaxis]
+    # Count-weighted regularization: Sigma += (count_reg_scale² / n) × I
+    # For sparse voxels (small n): large isotropic term → behaves like point-to-point ICP.
+    # For dense voxels (large n): negligible additive term → pure GICP covariance.
+    # This bridges GICP and point-to-point, eliminating the accuracy cliff from sparse maps.
+    if n_counts is not None:
+        n_safe = np.maximum(n_counts, 1).astype(np.float64)  # (n,)
+        count_reg = (count_reg_scale ** 2 / n_safe)[:, np.newaxis, np.newaxis] * np.eye(3)
+        Sigma_reg = Sigma_reg + count_reg
 
     # Intensity precision scalar per voxel
     grad_sq_proxy = var_intensities / (voxel_sizes ** 2 + 1e-9)   # (n,)
@@ -153,66 +173,32 @@ def batch_precision_matrices(
     omega_I = 1.0 / (sigma_sq + eps_psd)                                   # (n,)
 
     if device is None:
-        # Numpy fallback: per-matrix inversion
+        # Omega IS the precision matrix: Omega = diag(Sigma_geo^{-1}, omega_I).
+        # No double inversion needed — Omega is already in information form.
         for i in range(n):
             try:
                 Omega[i, :3, :3] = np.linalg.inv(Sigma_reg[i])
             except np.linalg.LinAlgError:
                 Omega[i, :3, :3] = np.linalg.pinv(Sigma_reg[i])
             Omega[i, 3, 3] = omega_I[i]
+        return Omega
 
-        # Omega is block-diagonal, so C = Omega^{-1} is also block-diagonal
-        C = np.zeros((n, 4, 4), dtype=np.float64)
-        for i in range(n):
-            try:
-                C[i] = np.linalg.inv(Omega[i] + eps_psd * np.eye(4))
-            except np.linalg.LinAlgError:
-                C[i] = np.linalg.pinv(Omega[i] + eps_psd * np.eye(4))
-        # symmetrize
-        C = 0.5 * (C + C.transpose(0, 2, 1))
-        # C_inv = Omega (since C = Omega^{-1} → C^{-1} = Omega)
-        prec = np.zeros((n, 4, 4), dtype=np.float64)
-        for i in range(n):
-            try:
-                prec[i] = np.linalg.inv(C[i] + eps_psd * np.eye(4))
-            except np.linalg.LinAlgError:
-                prec[i] = np.linalg.pinv(C[i] + eps_psd * np.eye(4))
-        return prec
+    # GPU path: Omega IS the precision matrix directly.
+    Sigma_t   = torch.tensor(Sigma_reg, dtype=torch.float64, device=device)   # (n, 3, 3)
+    omega_I_t = torch.tensor(omega_I,   dtype=torch.float64, device=device)   # (n,)
 
-    # GPU path: batch inversion
-    Sigma_t = torch.tensor(Sigma_reg, dtype=torch.float64, device=device)    # (n, 3, 3)
-    omega_I_t = torch.tensor(omega_I, dtype=torch.float64, device=device)    # (n,)
-    eps_t = torch.tensor(eps_psd, dtype=torch.float64, device=device)
-
-    # Batch invert geometric blocks
+    # Batch invert geometric blocks: Omega_geo = Sigma_reg^{-1}
     try:
-        Omega_geo = torch.linalg.inv(Sigma_t)   # (n, 3, 3)
+        Omega_geo = torch.linalg.inv(Sigma_t)    # (n, 3, 3)
     except Exception:
         Omega_geo = torch.linalg.pinv(Sigma_t)
 
-    # Assemble (n, 4, 4) Omega
+    # Assemble (n, 4, 4) precision = diag(Omega_geo, omega_I)
     Omega_t = torch.zeros(n, 4, 4, dtype=torch.float64, device=device)
     Omega_t[:, :3, :3] = Omega_geo
-    Omega_t[:, 3, 3] = omega_I_t
+    Omega_t[:, 3, 3]   = omega_I_t
 
-    # C = Omega^{-1}  (block-diagonal → stable)
-    Omega_reg = Omega_t + eps_t * torch.eye(4, dtype=torch.float64, device=device)
-    try:
-        C_t = torch.linalg.inv(Omega_reg)
-    except Exception:
-        C_t = torch.linalg.pinv(Omega_reg)
-
-    # Symmetrize C
-    C_t = 0.5 * (C_t + C_t.transpose(-1, -2))
-
-    # Precision = C^{-1}
-    C_reg = C_t + eps_t * torch.eye(4, dtype=torch.float64, device=device)
-    try:
-        prec_t = torch.linalg.inv(C_reg)
-    except Exception:
-        prec_t = torch.linalg.pinv(C_reg)
-
-    return prec_t.cpu().numpy()   # (n, 4, 4)
+    return Omega_t.cpu().numpy()   # (n, 4, 4)
 
 
 # ─── 3. GPU-accelerated GN Hessian/gradient accumulation ─────────────────────
@@ -226,14 +212,15 @@ def gn_hessian_gradient(
     R_cur: np.ndarray,             # (3, 3) current rotation
     alpha: float,
     device,
+    weights: Optional[np.ndarray] = None,  # (M',) per-point Huber/Cauchy weights
 ) -> Tuple[np.ndarray, np.ndarray]:   # H (6,6), b (6,)
     """
     GPU-accelerated Gauss-Newton Hessian and gradient accumulation.
 
     Replaces the three einsum calls in _gauss_newton_vectorized():
-      JtC = einsum('mji,mjk->mik', J, t_prec)   (M', 6, 4)
-      H   = einsum('mij,mjk->ik',  JtC, J)       (6, 6)
-      b   = einsum('mij,mj->i',    JtC, d)       (6,)
+      JtC = einsum('mji,mjk->mik', J, t_prec)         (M', 6, 4)
+      H   = einsum('mij,m,mjk->ik',  JtC, w, J)       (6, 6)  ← per-point weights
+      b   = einsum('mij,m,mj->i',    JtC, w, d)       (6,)    ← per-point weights
 
     Target arrays (t_means, t_prec, t_grad) are pre-cached on GPU and indexed
     by valid correspondence indices to avoid per-iteration full transfers.
@@ -249,7 +236,7 @@ def gn_hessian_gradient(
             return np.asarray(x)
         return _gn_hessian_numpy(src_valid, src_int_valid,
                                  _to_np(t_means_gpu), _to_np(t_prec_gpu), _to_np(t_grad_gpu),
-                                 R_cur, alpha)
+                                 R_cur, alpha, weights)
 
     M = len(src_valid)
     I3 = torch.eye(3, dtype=torch.float64, device=device)
@@ -269,13 +256,21 @@ def gn_hessian_gradient(
     t_prec  = _to_torch(t_prec_gpu)    # (M', 4, 4)
     t_grad  = _to_torch(t_grad_gpu)    # (M', 3)
 
-    # 4D Residual
+    # Per-point Huber/Cauchy weights (default: uniform)
+    if weights is not None:
+        w_t = torch.tensor(np.asarray(weights), dtype=torch.float64, device=device)
+    else:
+        w_t = torch.ones(M, dtype=torch.float64, device=device)
+
+    # 4D Residual  (src_t is already the TRANSFORMED source: q = R@p + t)
     d_xyz = src_t - t_means[:, :3]                        # (M', 3)
     d_i   = alpha * src_i - t_means[:, 3]                 # (M',)
     d     = torch.cat([d_xyz, d_i.unsqueeze(-1)], dim=-1) # (M', 4)
 
-    # Jacobian J_xyz (M', 3, 6)
-    Rp = (R_t @ src_t.T).T     # (M', 3)
+    # Jacobian J_xyz (M', 3, 6) for left SE(3) perturbation: T_new = exp(ξ) @ T_cur
+    # J_xyz[i] = [-skew(q_i), I_3]  where q_i = T_cur @ p_s = R@p_s + t (= src_t)
+    # src_t is already the transformed source q = R@p + t (NOT p_s), so Rp = src_t.
+    Rp = src_t     # (M', 3) = q = R@p_s + t  (already transformed, no extra R needed)
     J_xyz = torch.zeros(M, 3, 6, dtype=torch.float64, device=device)
     J_xyz[:, 0, 1] =  Rp[:, 2]
     J_xyz[:, 0, 2] = -Rp[:, 1]
@@ -290,10 +285,10 @@ def gn_hessian_gradient(
     J[:, :3, :] = J_xyz
     J[:, 3, :]  = -alpha * torch.einsum('mi,mij->mj', t_grad, J_xyz)
 
-    # Hessian accumulation
-    JtC = torch.einsum('mji,mjk->mik', J, t_prec)  # (M', 6, 4)
-    H   = torch.einsum('mij,mjk->ik',  JtC, J)     # (6, 6)
-    b   = torch.einsum('mij,mj->i',    JtC, d)     # (6,)
+    # Weighted Hessian and gradient accumulation (per-point Huber/Cauchy)
+    JtC = torch.einsum('mji,mjk->mik', J, t_prec)          # (M', 6, 4)
+    H   = torch.einsum('mij,m,mjk->ik', JtC, w_t, J)       # (6, 6)
+    b   = torch.einsum('mij,m,mj->i',   JtC, w_t, d)       # (6,)
 
     return H.cpu().numpy(), b.cpu().numpy()
 
@@ -301,17 +296,22 @@ def gn_hessian_gradient(
 def _gn_hessian_numpy(
     src_valid, src_int_valid,
     t_means, t_prec, t_grad,
-    R_cur, alpha,
+    R_cur, alpha, weights=None,
 ) -> Tuple[np.ndarray, np.ndarray]:
     """Pure numpy fallback for gn_hessian_gradient (identical math)."""
     M = len(src_valid)
     I3 = np.eye(3)
 
+    # src_valid is already the TRANSFORMED source: q = R@p + t
     d_xyz = src_valid - t_means[:, :3]
     d_i   = alpha * src_int_valid - t_means[:, 3]
     d     = np.column_stack([d_xyz, d_i])
 
-    Rp = (R_cur @ src_valid.T).T
+    # Per-point weights (default: uniform)
+    w = weights if weights is not None else np.ones(M)
+
+    # Jacobian for left SE(3) perturbation: Rp = q = R@p + t (= src_valid, already transformed)
+    Rp = src_valid  # (M', 3) — no extra R needed
     J_xyz = np.zeros((M, 3, 6))
     J_xyz[:, 0, 1] =  Rp[:, 2]
     J_xyz[:, 0, 2] = -Rp[:, 1]
@@ -326,8 +326,8 @@ def _gn_hessian_numpy(
     J[:, 3, :]  = -alpha * np.einsum('mi,mij->mj', t_grad, J_xyz)
 
     JtC = np.einsum('mji,mjk->mik', J, t_prec)
-    H   = np.einsum('mij,mjk->ik',  JtC, J)
-    b   = np.einsum('mij,mj->i',    JtC, d)
+    H   = np.einsum('mij,m,mjk->ik', JtC, w, J)   # per-point weighted
+    b   = np.einsum('mij,m,mj->i',   JtC, w, d)   # per-point weighted
     return H, b
 
 

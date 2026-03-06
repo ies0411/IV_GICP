@@ -1,0 +1,39 @@
+{
+  "meta": {
+    "bag": "/home/km/data/hilti/2022/exp07_long_corridor.bag",
+    "n_frames": 1322,
+    "duration_s": 132.08417773246765,
+    "avg_pts_per_frame": 47417.40015128593
+  },
+  "methods": {
+    "KISS-ICP": {
+      "mean_ms": 9.946767412831953,
+      "median_ms": 9.247959940694273,
+      "std_ms": 3.5208198420125663,
+      "hz": 100.53517474530845,
+      "path_length_m": 184.4476602597793,
+      "end_displacement_m": 102.39810802656262,
+      "n_frames": 1322
+    },
+    "IV-GICP": {
+      "mean_ms": 119.06700971149286,
+      "median_ms": 102.11223480291665,
+      "std_ms": 65.25804748572368,
+      "hz": 8.398632017576197,
+      "path_length_m": 219.21645598062247,
+      "end_displacement_m": 38.57599815891934,
+      "n_frames": 1322,
+      "device": "cuda"
+    },
+    "GICP-Baseline": {
+      "mean_ms": 43.88929508417777,
+      "median_ms": 44.54440204426646,
+      "std_ms": 13.53385191893747,
+      "hz": 22.784599253235744,
+      "path_length_m": 176.01157709145056,
+      "end_displacement_m": 115.02255025118181,
+      "n_frames": 1322,
+      "device": "cuda"
+    }
+  }
+}
