@@ -28,6 +28,14 @@ from iv_gicp.gpu_backend import (
     TargetGPUCache,
 )
 
+# C++ core: full GN loop in Eigen (no Python/CUDA overhead per iteration)
+try:
+    from iv_gicp.cpp import iv_gicp_core as _cpp_core
+    _CPP_CORE_AVAILABLE = True
+except ImportError:
+    _cpp_core = None
+    _CPP_CORE_AVAILABLE = False
+
 
 # ─── Lie algebra helpers ──────────────────────────────────────────────────────
 
@@ -330,6 +338,35 @@ class IVGICP:
 
         return means_v, voxels_4d, tree
 
+    def register_with_arrays(
+        self,
+        src_xyz: np.ndarray,
+        src_intensities: np.ndarray,
+        target_arrays: dict,
+        init_pose: Optional[np.ndarray] = None,
+        max_corr_dist: Optional[float] = None,
+    ) -> Tuple[np.ndarray, dict]:
+        """
+        Register source to pre-built target arrays (C++ fast path).
+        Bypasses Voxel4D extraction — arrays come directly from VoxelMap.build_target_arrays.
+        """
+        target_means_4d   = np.ascontiguousarray(target_arrays["means_4d"],  dtype=np.float64)
+        target_precisions = np.ascontiguousarray(target_arrays["prec"],      dtype=np.float64)
+        target_grads      = np.ascontiguousarray(target_arrays["grads"],     dtype=np.float64)
+        means_3d          = np.ascontiguousarray(target_arrays["means_3d"],  dtype=np.float64)
+        self._gpu_cache.load(target_means_4d, target_precisions, target_grads)
+
+        T = np.eye(4) if init_pose is None else np.array(init_pose, dtype=float)
+        # Build tree from means_3d for the Python GN fallback path.
+        # The C++ GN path (iv_gicp_core) builds its own tree internally.
+        tree = FastKDTree(means_3d)
+        T, info = self._gauss_newton_vectorized(
+            src_xyz[:, :3], src_intensities,
+            means_3d, target_means_4d, target_precisions, target_grads,
+            tree, T, max_corr_dist=max_corr_dist,
+        )
+        return T, info
+
     def _precompute_target_arrays(
         self,
         voxels_t: List[Voxel4D],
@@ -390,6 +427,30 @@ class IVGICP:
         info = {"iterations": 0, "n_correspondences": 0, "converged": False}
         H = None  # Hessian from last GN iteration (None if no correspondences found)
 
+        # ── C++ fast path: full GN loop in Eigen (no Python/CUDA overhead) ───
+        if _CPP_CORE_AVAILABLE:
+            result = _cpp_core.icp_register(
+                np.ascontiguousarray(src_xyz,          dtype=np.float64),
+                np.ascontiguousarray(src_intensities,  dtype=np.float64),
+                np.ascontiguousarray(target_means_4d,  dtype=np.float64),
+                np.ascontiguousarray(target_precisions.reshape(n_target, 4, 4), dtype=np.float64),
+                np.ascontiguousarray(target_grads,     dtype=np.float64),
+                np.ascontiguousarray(means_t,          dtype=np.float64),
+                np.ascontiguousarray(T,                dtype=np.float64),
+                float(corr_dist),
+                float(self.alpha),
+                int(self.max_iter),
+                float(self.huber_delta),
+                6,  # min_valid
+            )
+            info["iterations"]       = result["iterations"]
+            info["n_correspondences"] = result["n_valid"]
+            info["converged"]        = result["converged"]
+            if result["n_valid"] >= 6:
+                info["hessian"] = result["H"]
+            return result["T"], info
+
+        # ── Python/GPU fallback (used if C++ not built) ───────────────────────
         for iteration in range(self.max_iter):
             R_cur = T[:3, :3]
             t_cur = T[:3, 3]

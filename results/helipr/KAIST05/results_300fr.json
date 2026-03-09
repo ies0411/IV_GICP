@@ -1,0 +1,19 @@
+{
+  "seq": "KAIST05",
+  "frames": 300,
+  "params": {
+    "seq": "KAIST05",
+    "max_frames": 300,
+    "device": "cuda",
+    "alpha": 0.1,
+    "voxel_size": 1.0,
+    "max_map_frames": 10,
+    "window_size": 1,
+    "skip_kiss": false
+  },
+  "ate": {
+    "gicp_baseline": 0.12918627314651712,
+    "iv_gicp_a0.1": 0.12958963784573363,
+    "kiss_icp": 0.11775791340819863
+  }
+}

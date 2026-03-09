@@ -307,6 +307,7 @@ def run_iv_gicp(frames_gen, dataset_info, args, alpha=0.1):
         max_range=50.0,
         adaptive_voxelization=args.adaptive,
         max_map_frames=args.max_map_frames,
+        map_radius=50.0,              # spatial eviction: keep map near robot (underground)
         window_size=args.window_size,
         device=args.device,
     )

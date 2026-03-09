@@ -223,6 +223,7 @@ def run_gicp_baseline(frames, device="cuda", window_size=1):
         max_iterations=30,
         adaptive_voxelization=False,
         max_map_frames=40,
+        map_radius=80.0,              # spatial eviction: keep map near robot
         window_size=window_size,
         device=device,
         use_distribution_propagation=False,

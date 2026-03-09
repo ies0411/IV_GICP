@@ -90,9 +90,11 @@ class PoseGraphOptimizer:
             omega = np.eye(6) * self.odometry_weight
         self.odom_factors.append(OdometryFactor(i=i, j=j, T_meas=T_rel, omega=omega))
 
-    def set_prior(self, T: np.ndarray) -> None:
-        """Set prior on first pose."""
-        self.prior = PriorFactor(T_prior=T, omega=np.eye(6) * self.prior_weight)
+    def set_prior(self, T: np.ndarray, omega: Optional[np.ndarray] = None) -> None:
+        """Set prior on first pose. omega overrides default prior_weight * I."""
+        if omega is None:
+            omega = np.eye(6) * self.prior_weight
+        self.prior = PriorFactor(T_prior=T, omega=omega)
 
     def _get_factors_in_window(self, window_end: int) -> Tuple[List, List]:
         """Get factors affecting poses in the sliding window."""

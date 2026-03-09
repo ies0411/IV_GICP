@@ -162,6 +162,7 @@ def run_iv_gicp(frames, device="cuda", window_size=1):
         max_correspondence_distance=1.5,
         initial_threshold=1.5,
         max_iterations=20,
+        map_radius=60.0,              # spatial eviction for metro tunnel
         window_size=window_size,
         device=device,
         use_distribution_propagation=False,
@@ -191,6 +192,7 @@ def run_gicp_baseline(frames, device="cuda"):
         max_correspondence_distance=1.5,
         initial_threshold=1.5,
         max_iterations=20,
+        map_radius=60.0,              # spatial eviction for metro tunnel
         device=device,
         use_distribution_propagation=False,
     )

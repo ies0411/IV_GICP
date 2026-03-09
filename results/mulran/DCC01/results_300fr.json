@@ -1,0 +1,19 @@
+{
+  "seq": "DCC01",
+  "frames": 300,
+  "params": {
+    "seq": "DCC01",
+    "max_frames": 300,
+    "device": "cuda",
+    "alpha": 0.1,
+    "voxel_size": 1.0,
+    "max_map_frames": 10,
+    "window_size": 1,
+    "skip_kiss": false
+  },
+  "ate": {
+    "gicp_baseline": 0.2672247540330827,
+    "iv_gicp_a0.1": 0.2668107976757197,
+    "kiss_icp": 0.3102826604052218
+  }
+}
