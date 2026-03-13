@@ -16,7 +16,7 @@ from typing import Optional
 # Add project root
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from iv_gicp import IVGICPPipeline, AdaptiveVoxelMap, IVGICP
+from iv_gicp import IVGICPPipeline, IVGICP
 
 
 def generate_synthetic_sequence(
@@ -137,7 +137,8 @@ def main():
     for i, frame in enumerate(frames):
         result = pipeline.process_frame(frame, timestamp=float(i))
         if i == 0:
-            print(f"  Frame {i}: Initial map built, {pipeline.adaptive_map.get_voxel_count()} voxels")
+            n_voxels = len(pipeline.flat_map.leaves) if pipeline.flat_map is not None else 0
+            print(f"  Frame {i}: Initial map built, {n_voxels} voxels")
         else:
             t = result.pose[:3, 3]
             print(f"  Frame {i}: pose = [{t[0]:.3f}, {t[1]:.3f}, {t[2]:.3f}]")

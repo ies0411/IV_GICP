@@ -12,13 +12,13 @@ Modules:
 - pipeline: Full odometry pipeline
 """
 
-from .adaptive_voxelization import AdaptiveVoxelMap
 from .iv_gicp import IVGICP
 from .distribution_propagation import DistributionPropagator, VoxelDistribution
 from .factor_graph import PoseGraphOptimizer, FormMapUpdater, OdometryFactor, PriorFactor
 from .form_map import FormMap
 from .map_refinement import MapRefinementBenchmark, RefinementResult
 from .pipeline import IVGICPPipeline, OdometryResult, Trajectory
+from .odometry import IVGICPOdometry
 from .degeneracy_analysis import (
     DegeneracyMonitor,
     DegeneracyReport,
@@ -29,7 +29,6 @@ from .degeneracy_analysis import (
 )
 
 __all__ = [
-    "AdaptiveVoxelMap",
     "IVGICP",
     "DistributionPropagator",
     "VoxelDistribution",
@@ -40,6 +39,7 @@ __all__ = [
     "FormMap",
     "MapRefinementBenchmark",
     "RefinementResult",
+    "IVGICPOdometry",
     "IVGICPPipeline",
     "OdometryResult",
     "Trajectory",

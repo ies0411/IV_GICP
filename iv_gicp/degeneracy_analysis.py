@@ -28,6 +28,12 @@ Proposition 1 (FIM Complementarity):
     the floor provide intensity gradients perpendicular to the markings,
     which typically have a component along the corridor axis.
 
+  Correspondence weighting (A.2): Upweight intensity residual for pairs i
+    satisfying (∇μ_I)^T J_xyz v ≠ 0. Implemented as per-point weight
+    w_i ∝ max(ε, v^T (J_int_i^T J_int_i) v) when κ_geo ≥ degeneracy_kappa_threshold,
+    so only correspondences that contribute to I_I along the degenerate direction v
+    receive strong intensity weight; others are downweighted to reduce noise.
+
 Usage:
   After IV-GICP registration, call analyze_registration_degeneracy() with
   the Gauss-Newton intermediates to generate FIM analysis for the paper.

@@ -5,6 +5,12 @@ Implements Section 11 (Theoretical Reinforcements) of IV-GICP paper:
   - Section 11.E: Unified FIM maximization framework
   - Section 11.F: Degeneracy Recovery Theorem (Theorem 1)
 
+Well-posed regime (Theorem 1 converse, 2026):
+  When I_G is already well-conditioned (κ_geo < τ), geometry-only is sufficient:
+  v^T I_total v ≈ v^T I_G v > 0, so α→0 is theoretically justified. The pipeline
+  option well_posed_polish refines the pose with 1–2 geometry-only GN steps when
+  κ_geo < well_posed_kappa_threshold to reduce intensity noise in outdoor scenes.
+
 Key functions:
   compute_fim_components()    -- split I_G and I_I from correspondences
   degeneracy_metrics()        -- λ_min, condition number, degeneracy index

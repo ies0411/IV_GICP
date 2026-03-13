@@ -8,7 +8,7 @@
 
 ## **Abstract** _(150-250 words, ICRA 필수)_
 
-LiDAR odometry faces three fundamental challenges: fixed-resolution voxelization causing computational inefficiency in flat terrain and detail loss in complex structures, geometric degeneracy in featureless environments such as tunnels and corridors that leads to drift, and inefficient map maintenance when factor graph optimization requires costly point-wise updates. This paper presents IV-GICP, a unified framework that addresses all three issues through a distribution-centric design. First, we propose information-theoretic adaptive voxelization using Shannon entropy and intensity variance as splitting criteria in an octree structure, enabling finer resolution where geometric or photometric complexity is high. Second, we extend the probabilistic registration to a four-dimensional geo-photometric space, fusing geometric and photometric covariances so that texture-rich regions (e.g., lane markings) constrain the pose even when geometry is degenerate. Third, we introduce retroactive map distribution propagation that updates voxel statistics (mean and covariance) via Lie theory instead of transforming individual points, reducing map refinement cost by orders of magnitude compared to factor graph-based methods. Experiments on tunnel/corridor datasets demonstrate robustness to geometric degeneracy, while comparisons with VGICP and FORM validate both accuracy and efficiency. IV-GICP achieves adaptive, robust, and efficient LiDAR odometry in a single probabilistic framework.
+LiDAR odometry faces geometric degeneracy in featureless environments (e.g. tunnels and corridors) that leads to drift; existing methods such as GenZ-ICP use heuristic plane/point selection. This paper presents IV-GICP, a unified framework that avoids plane/point switching by a single 4D geo-photometric residual and information-theoretic weighting. We (C1) weight each voxel by its Fisher information contribution so that more informative correspondences are trusted more; (C2) fuse geometry and intensity into one 4D covariance so that texture-rich regions constrain the pose when geometry is degenerate (Theorem 1 guarantees well-posedness without an explicit degeneracy detector); and (C3) set per-voxel geometry vs intensity trust by the same entropy measure for a principled balance. We apply a Huber kernel on the 4D Mahalanobis residual for robust registration. When a sliding window is used, map refinement can be done via distribution propagation (O(V)) instead of point-wise updates. Experiments on tunnel/corridor datasets demonstrate robustness to degeneracy; comparisons with GenZ-ICP and VGICP validate accuracy. IV-GICP achieves robust and efficient LiDAR odometry in a single probabilistic framework.
 
 ---
 
@@ -31,10 +31,10 @@ Real-time LiDAR odometry is essential for autonomous robots and vehicles. While 
 
 ### 2.3 Contributions
 
-- **C1:** Information-theoretic adaptive voxelization with combined geometric and photometric entropy criteria for resolution adaptation.
-- **C2:** Geo-photometric probabilistic registration (IV-GICP) that fuses intensity into covariance to mitigate geometric degeneracy.
-- **C3:** Retroactive distribution propagation for efficient map refinement without point-wise transforms.
-- **C4:** A unified pipeline that is adaptive, robust, and efficient, validated on challenging datasets.
+- **C1:** FIM-based per-voxel weighting: we weight each correspondence by its contribution to the Fisher information (e.g. v^T I_I v in degenerate directions), so that more informative voxels are trusted more—without switching residual type (plane/point) as in GenZ-ICP.
+- **C2:** Geo-photometric probabilistic registration (IV-GICP) that fuses intensity into a single 4D covariance; a unified residual obviates plane/point selection (Theorem 1 guarantees well-posedness without an explicit degeneracy detector).
+- **C3:** Entropy-consistent geo/intensity balance: per-voxel trust between geometry and intensity is set by the same entropy measure (e.g. geometric entropy), giving a principled, information-theoretic balance rather than heuristic plane/point switching.
+- **C4:** A unified pipeline that is robust and efficient, validated on challenging datasets. When a sliding window of keyframes is used, map refinement can be done via distribution propagation (O(V)) instead of point-wise updates; we mention this where relevant but do not emphasize it as a main contribution.
 
 ---
 
@@ -67,7 +67,7 @@ When $\kappa$ exceeds a threshold, it adaptively adjusts the weight between poin
 $$\alpha = \frac{N_{\text{pl}}}{N_{\text{pl}} + N_{\text{po}}}, \quad \text{Cost} = \alpha \|\mathbf{e}_{\text{pl}}\|^2 + (1-\alpha)\|\mathbf{e}_{\text{po}}\|^2$$
 This is purely geometry-based: it cannot exploit texture/intensity information in featureless corridors where both point-to-plane and point-to-point are degenerate.
 
-**IV-GICP vs GenZ-ICP**: By Theorem 1, IV-GICP's combined FIM $\mathcal{I}_{total} = \mathcal{I}_G + \mathcal{I}_I$ satisfies $\lambda_{\min}(\mathcal{I}_{total}) \geq \epsilon/\sigma_I^2 \cdot \sum_i \|J_i\mathbf{v}\|^2 > 0$ for all non-trivial directions $\mathbf{v}$, without requiring condition number monitoring or threshold tuning. Quantitative comparison of $\kappa_{GenZ}$ vs $\lambda_{\min}(\mathcal{I}_{total})$ is provided in the experiments (Section 5).
+**IV-GICP vs GenZ-ICP**: We do not require plane/point selection (cf. GenZ-ICP); a single 4D residual with Theorem 1 suffices. By Theorem 1, IV-GICP's combined FIM $\mathcal{I}_{total} = \mathcal{I}_G + \mathcal{I}_I$ satisfies $\lambda_{\min}(\mathcal{I}_{total}) \geq \epsilon/\sigma_I^2 \cdot \sum_i \|J_i\mathbf{v}\|^2 > 0$ for all non-trivial directions $\mathbf{v}$, without requiring condition number monitoring or threshold tuning. Quantitative comparison of $\kappa_{GenZ}$ vs $\lambda_{\min}(\mathcal{I}_{total})$ is provided in the experiments (Section 5).
 
 ### 3.3 Degeneracy Regularization
 
@@ -81,26 +81,7 @@ is precisely a **principled Tikhonov regularization** in the photometric directi
 
 이 논문은 \*\*"모든 것을 확률 분포(Distribution)로 본다"\*\*는 철학 하에 설계됩니다.
 
-### **A. Frontend 1: 정보 엔트로피 기반 적응형 복셀화 (Adaptive Voxelization)**
-
-\*\*"어디를 쪼개고 어디를 합칠 것인가?"\*\*에 대한 수학적 해답을 제시합니다.
-
-- **기존 문제:** 단순 Grid 나눈 후 평균/분산 계산.
-- **제안 아이디어:** **Two-Level Adaptive Flat Voxel Map (Coarse + Fine)**
-  - Coarse 맵(voxel_size)과 Fine 맵(voxel_size/2)을 동시에 유지하는 이중 구조.
-  - 각 복셀은 가우시안 분포 $\mathcal{N}(\mu, \Sigma)$로 표현되며 Welford 온라인 알고리즘으로 증분 업데이트.
-  - **결합 분할 기준 (Combined Splitting Criterion):**
-    $$S = H_{geo} + \lambda \cdot H_{int} > \tau_{split}$$
-    - $H_{geo} = \frac{1}{2}\ln|(2\pi e)^3 \Sigma|$ : 기하학적 Shannon 엔트로피
-    - $H_{int} = \frac{1}{2}\ln(2\pi e \cdot \sigma_I^2)$ : 강도 Shannon 엔트로피
-    - $\lambda = 0.1$ : 단위 보정 가중치, $\tau_{split} = 2.0$ : 분할 임계값
-  - **알고리즘:**
-    1. Coarse 복셀의 $S$를 계산.
-    2. $S > \tau_{split}$이면 해당 Coarse 복셀 영역의 **Fine 복셀**을 사용 (세밀 해상도).
-    3. $S \leq \tau_{split}$이면 **Coarse 복셀** 유지 (계산 효율).
-    4. **Key Innovation:** Octree 재빌드 없이 O(N_frame) 증분 삽입으로 실시간 운용. 기하·광도 복잡성 모두 반영.
-
-### **B. Frontend 2: 기하-광도 결합 확률 정합 (Geo-Photometric Probabilistic Registration)**
+### **A. 기하-광도 결합 확률 정합 (Geo-Photometric Probabilistic Registration)**
 
 \*\*"미끄러짐을 어떻게 잡을 것인가?"\*\*에 대한 해답입니다.
 
@@ -108,10 +89,10 @@ is precisely a **principled Tikhonov regularization** in the photometric directi
   - $p\_i \= \[x, y, z, \\alpha \\cdot I\]^T$ ($\\alpha$: 단위 보정 상수)
 - **Intensity Gradient 활용:** BEV 이미지나 Voxel 내에서 Intensity Gradient $\\nabla I$를 계산하여, **Intensity 방향의 불확실성**을 공분산에 반영합니다.
 - **수식적 통합 (Generalized Cost Function):**
-  $$T^\* \= \\underset{T}{\\text{argmin}} \\sum\_i d\_i^T (C\_i^G \+ C\_i^I \+ C\_i^{Adaptive})^{-1} d\_i$$
-  - $C\_i^G$: 기하학적 공분산 (기존 VGICP)
-  - $C\_i^I$: **광도학적 공분산 (Photometric Covariance)**. 텍스처가 없는 곳에서는 무한대로 발산하여 영향력이 0이 되고, 텍스처가 강한 곳에서는 좁아져서 정합을 꽉 잡아줍니다.
-  - **결과:** 복도(Geometry Degeneracy)에서는 $C\_i^G$가 헐거워지지만, 벽면의 얼룩이나 바닥의 차선 덕분에 $C\_i^I$가 Tight해져서 위치를 놓치지 않습니다.
+  $$T^\* \= \\underset{T}{\\text{argmin}} \\sum\_i w\_i \\, d\_i^T \\Omega\_i \\, d\_i, \\quad \\Omega\_i = (C\_i^G + C\_i^I)^{-1}$$
+  - $C\_i^G$: 기하학적 공분산 (기존 VGICP), $C\_i^I$: **광도학적 공분산**. 텍스처가 없는 곳에서는 영향력이 0이 되고, 텍스처가 강한 곳에서는 정합을 꽉 잡아줍니다.
+  - $w_i$: per-correspondence weight (C1: FIM 기여도 기반; optional). **Robust weighting:** 표준 GICP에는 robust kernel이 없으나, 우리는 4D 잔차의 Mahalanobis 거리 $r_i = \sqrt{d_i^T \Omega_i d_i}$에 Huber kernel을 적용하여 기하·강도 아웃라이어를 일관되게 downweight (보조 설계, Method/알고리즘 표에 명시).
+  - **결과:** 복도에서는 $C\_i^G$가 헐거워지지만, $C\_i^I$가 tight해져서 위치를 놓치지 않습니다.
 - **Fisher Information Matrix (FIM) 분석:** $C_i^{-1} = C_i^{G^{-1}} + C_i^{I^{-1}}$ 형태에서, 기하학적 degenerate 방향의 FIM이 0에 가까우면 $C_i^I$의 해당 방향 요소가 유한값을 가져 정합을 유지시킵니다. (Supplementary에서 상세 유도)
 
 #### **결합 공분산 공식화 (Combined Source-Target Covariance)**
@@ -135,41 +116,20 @@ $$\Omega_{zz}^{max} = \frac{1}{\sigma_s^2 + \epsilon} \approx \frac{1}{\sigma_s^
 **강도 정규화:** LiDAR 센서마다 원시 강도값의 스케일이 다릅니다 (KITTI: $[0, 1]$, Hilti Pandar: $[0, 200]$). 스케일이 다르면 광도 정밀도 $\omega_I = \alpha^2 / (\text{Var}(I)/\ell_v^2 + \epsilon)$가 기하 정밀도 $\Omega_{geo}$를 $\sim 50\times$ 이상 압도하여 intensity 항이 등록을 지배하고 drift를 유발합니다. 따라서 전처리 단계에서 강도값을 $[0, 1]$로 정규화합니다 (99th percentile 기준):
 $$I_{norm} = \frac{I}{\text{percentile}_{99}(I)} \quad \text{if } \text{percentile}_{99}(I) > 1.0$$
 
-### **C. Backend: 소급적 분포 전파 (Retroactive Distribution Propagation)**
+### **B. Backend: 슬라이딩 윈도우 시 분포 전파 (Distribution Propagation, 언급)**
 
-\*\*"지도를 어떻게 효율적으로 고칠 것인가?"\*\*에 대한 해답입니다. (FORM 개선)
-
-- **기존 FORM의 한계:** 각 키프레임의 포인트를 로컬 프레임에 저장한 뒤, 매 프레임 `to_voxel_map(poses)`로 전체 포인트를 월드 좌표로 변환 → **O(N_pts × W)** 비용 (N_pts: 키프레임당 포인트 수, W: 윈도우 크기).
-- **제안 아이디어 (Local Keyframe Voxel Map):**
-  - 각 스캔의 복셀 통계 $(\mu, \Sigma)$를 **센서 로컬 프레임**에 저장.
-  - 월드 맵은 온디맨드로 구성: $\mu_w = R_k \mu_{local} + t_k$, $\Sigma_w = R_k \Sigma_{local} R_k^T$ ← **정확한 SE(3) 변환, 근사 없음**.
-  - 포즈 추정값이 개선되면(Smoother/Factor Graph), `update_poses()` 호출 → 다음 맵 접근 시 **O(V)** 비용으로 수정된 월드 맵 자동 구성.
-  - **비교:**
-    | | FORM | Ours (C3) |
-    |---|---|---|
-    | 저장 | Raw 포인트 (로컬) | Voxel 분포 $(\mu, \Sigma)$ (로컬) |
-    | 월드 맵 재구성 비용 | O(N_pts × W) | **O(V)**, V ≪ N_pts × W |
-    | 포즈 수정 반영 | 전체 재구성 | `update_poses()` → 캐시 무효화 |
-  - **효과:** Voxelization 비율 ~1:50~1:200 적용 시, FORM 대비 **50~200배 빠른 맵 재구성**. 포즈 수정(Factor Graph, Smoother) 시 Raw 포인트 재처리 불필요.
-  - **포즈 불확실성 포함 전파 (Lie Algebra Perturbation):**
-    $$\Sigma_{new} = R_{\Delta T} \Sigma_{old} R_{\Delta T}^T + J_{\Delta T} \Sigma_{\Delta T} J_{\Delta T}^T$$
-    포즈 불확실성 $\Sigma_{\Delta T}$까지 반영하는 완전한 공분산 전파 구현 (`distribution_propagation.propagate_with_pose_uncertainty()`).
+슬라이딩 윈도우를 사용할 때, 포즈 수정(Factor Graph 등) 후 맵을 갱신하는 비용을 줄이기 위해 **분포 전파**를 쓸 수 있다: 각 키프레임의 복셀 통계 $(\mu, \Sigma)$를 로컬 프레임에 저장하고, 월드 맵은 $\mu_w = R_k \mu_{local} + t_k$, $\Sigma_w = R_k \Sigma_{local} R_k^T$로 온디맨드 구성. 포즈가 수정되면 O(V)로 재구성 가능 (FORM의 O(N_pts × W) 대비). 자세한 수식과 Lie algebra perturbation은 Section 10.D 및 Implementation Notes 참조.
 
 ---
 
 | 섹션                                | 내용 및 강조점 (Key Selling Point)                                                                                                                                                                                                                                     |
 | :---------------------------------- | :--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| **Introduction**                    | VGICP의 고정 격자 문제와 기하학적 퇴화 문제를 동시에 지적. "우리는 Adaptive & Multi-modal로 해결한다."                                                                                                                                                                 |
-| **Method 1: Adaptive Voxelization** | **Entropy 기반의 Octree 분할 수식** 제시. 기하학적 엔트로피와 광도학적 엔트로피를 결합했음을 강조. (수학적 깊이 어필)                                                                                                                                                  |
-| **Method 2: IV-GICP**               | 4차원 공간에서의 Mahalanobis Distance 유도. **Fisher Information Matrix** 분석을 통해 Intensity가 어떻게 기하학적 빈틈을 메우는지 증명.                                                                                                                                |
-| **Method 3: Map Refinement**        | FORM과 비교하여 점(Point)이 아닌 **분포(Distribution)를 업데이트**하는 방식의 효율성 증명. (시스템적 참신함)                                                                                                                                                           |
-| **Experiments**                     | 1\. **터널/복도 데이터셋:** 기존 VGICP/GenZ-ICP가 미끄러질 때 우리 모델은 Intensity로 버티는 모습. 2\. **Map Quality:** FORM 대비 속도는 빠르면서 Map의 선명도는 동등함을 보여줌. 3\. **Adaptive:** 평지에서는 복셀이 커지고, 복잡한 곳에선 작아지는 시각적 자료(Fig). |
+| **Introduction**                    | 기하 퇴화 문제와 GenZ-ICP의 plane/point 휴리스틱 한계 지적. "우리는 단일 4D residual과 정보이론적 가중치로 해결한다."                                                                                                                                                   |
+| **Method: IV-GICP (C1+C2+C3)**      | **C1** FIM 기반 per-voxel 가중치; **C2** 4D Mahalanobis + Theorem 1 (plane/point 선택 불필요); **C3** 엔트로피 일관된 geo/intensity 비중. Robust weighting: Huber on $r_i = \sqrt{d_i^T \Omega_i d_i}$.                                                                  |
+| **Backend (언급)**                  | 슬라이딩 윈도우 사용 시 분포 전파로 맵 갱신 O(V). FORM 대비 효율.                                                                                                                                                                                                     |
+| **Experiments**                     | 터널/복도에서 VGICP·GenZ-ICP 대비 견고성; κ vs $\lambda_{\min}(\mathcal{I}_{total})$ 비교.                                                                                                                                                                              |
 
-**"복셀 크기를 엔트로피(Entropy)로 조절하여 효율성을 잡고, 인텐시티(Intensity)를 공분산(Covariance)에 넣어 정확도를 잡고, 분포 전파(Distribution Propagation)로 맵 관리의 속도까지 잡은 완전체 오도메트리."**
-
-이 컨셉이면 **"Adaptive"**, **"Robust"**, **"Efficient"** 세 가지 키워드를 모두 수학적으로 풀어낼 수 있어 ICRA 심사위원들이 좋아하는 스타일이 됩니다.
-
-_이런 식으로 기존 VGICP의 격자 방식과 제안하는 Adaptive 방식의 차이를 보여주는 그림을 Method 1 섹션에 넣으면 매우 좋습니다._
+**"단일 4D residual에 FIM 가중치(C1)와 엔트로피 기반 기하/강도 비중(C3)을 더해, plane/point 선택 없이 Robust하고 Efficient한 LiDAR odometry."**
 
 ---
 
@@ -255,7 +215,7 @@ _(아래 KITTI 100fr 기준 수치; 전체 seq는 추후 보완)_
 
 ## **6. Conclusion**
 
-IV-GICP addresses three core limitations of LiDAR odometry through a unified distribution-centric design: (1) entropy-based adaptive voxelization for resolution adaptation, (2) geo-photometric registration for robustness to geometric degeneracy, and (3) retroactive distribution propagation for efficient map refinement. Experiments demonstrate that the method achieves adaptive, robust, and efficient odometry in challenging environments. Future work includes integration with inertial measurements and large-scale real-world deployment.
+IV-GICP addresses geometric degeneracy and the need for heuristic plane/point selection (e.g. GenZ-ICP) through a unified 4D residual and information-theoretic design: (1) FIM-based per-voxel weighting (C1), (2) geo-photometric 4D registration with Theorem 1 (C2), and (3) entropy-consistent geo/intensity balance (C3). Robust weighting is applied via a Huber kernel on the 4D Mahalanobis residual. Experiments demonstrate robust and efficient odometry in tunnel/corridor and outdoor datasets. When a sliding window is used, distribution propagation enables O(V) map refinement. Future work includes integration with inertial measurements and large-scale deployment.
 
 ---
 
@@ -281,9 +241,9 @@ IV-GICP addresses three core limitations of LiDAR odometry through a unified dis
 
 | 모듈                         | 핵심 데이터 구조                             | 주요 연산                                     |
 | ---------------------------- | -------------------------------------------- | --------------------------------------------- |
-| **Adaptive Voxelization**    | OctreeNode(mean, cov, intensity_var, points) | entropy_split_criterion(), subdivide()        |
-| **IV-GICP**                  | Voxel4D(mean_4d, precision_4d), corr_pairs   | batch_precision_matrices(), gn_hessian_gradient() |
-| **Distribution Propagation** | voxel_map: dict[voxel_id, (μ, Σ)]            | propagate_delta_T(ΔT, voxel_map)              |
+| **IV-GICP (C1/C2/C3)**       | Voxel4D(mean_4d, precision_4d), corr_pairs   | batch_precision_matrices(), gn_hessian_gradient(); C1: FIM weight; C3: per-voxel alpha/omega from entropy |
+| **Robust (Huber)**           | per-correspondence $r_i = \sqrt{d_i^T \Omega_i d_i}$ | Huber weight $w_i$; H, b에 $w_i$ 반영        |
+| **Distribution Propagation** | voxel_map: dict[voxel_id, (μ, Σ)] (윈도우 시) | propagate_delta_T(ΔT, voxel_map)             |
 | **FlatVoxelMap**             | hash_map: voxel_key → WelfordStats           | insert_frame(), evict_before(frame_id)        |
 
 **파이프라인:** PointCloud → `_prefilter` (range + downsample + intensity norm) → FlatVoxelMap → IV-GICP registration → (optional) FactorGraph → RetroactivePropagation → RefinedMap
@@ -326,6 +286,16 @@ if p99 > 1.0:
     intensities = intensities / p99  # → [0, ~1]
 ```
 KITTI는 이미 $[0,1]$이므로 no-op. Hilti는 정규화 후 $\omega_I \approx 0.44$으로 기하 항과 균형.
+
+#### 수정 4: Huber on 4D Mahalanobis residual (보조 설계)
+
+**배경:** 표준 GICP에는 robust kernel이 없음. 기존 구현은 **Euclidean 거리** (가장 가까운 복셀 중심까지)로 Huber weight를 계산함.
+
+**수정:** 4D 잔차의 **Mahalanobis 거리** $r_i = \sqrt{d_i^T \Omega_i d_i}$ 기준으로 Huber 적용:
+- $r_i \leq \delta$ → $w_i = 1$; $r_i > \delta$ → $w_i = \delta / r_i$.
+- 기하·강도 아웃라이어를 동일한 4D 공간에서 일관되게 downweight. Method/알고리즘 표에 "Robust weighting: Huber on $r = \sqrt{d^T \Omega d}$" 명시.
+
+**구현:** `iv_gicp.py` / `gpu_backend.py`: 대응별로 `d_i`, `Omega_i`로 `r_i` 계산 후 `weights` 인자로 `gn_hessian_gradient`에 전달. C++ core 동일.
 
 ---
 
@@ -526,9 +496,9 @@ $$\max_{\mathcal{V},\, C^I,\, \Sigma_{map}} \text{tr}\left(\mathcal{I}_{total}(T
 
 | Subproblem                                           | 최적화 변수                      | 해                                               | Contribution                     |
 | ---------------------------------------------------- | -------------------------------- | ------------------------------------------------ | -------------------------------- |
-| $\max_{\mathcal{V}} \text{tr}(\mathcal{I}_{total})$  | 복셀 집합 $\mathcal{V}$ (해상도) | 정보량이 높은 영역을 세밀하게 분할               | **C1: Adaptive Voxelization**    |
+| $\max_{w} \text{tr}(\mathcal{I}_{total})$ (가중 합)  | per-voxel weight $w_i$           | FIM 기여도 큰 복셀에 높은 가중치                  | **C1: FIM-based weighting**     |
 | $\max_{C^I} \text{tr}(\mathcal{I}_{total})$          | Intensity covariance $C^I$       | $\text{null}(\mathcal{I}_G)$를 채우는 $C^I$ 선택 | **C2: Intensity Augmentation**   |
-| $\max_{\Sigma_{map}} \text{tr}(\mathcal{I}_{total})$ | 맵 분포 $\Sigma_{map}$           | loop closure 후 정보 일관성 유지                 | **C3: Distribution Propagation** |
+| per-voxel $\alpha$/$\omega_I$                        | 엔트로피(기하 복잡도)            | 기하 엔트로피 높으면 intensity 비중 상대 증가   | **C3: Entropy-consistent balance** |
 
 **Proposition (Subproblem Decomposability):**
 
@@ -540,7 +510,7 @@ $$\max_{\mathcal{V}, C^I, \Sigma_{map}} \mathcal{I}_{total} = \left(\max_{\mathc
 
 **Narrative 재구성:**
 
-> "우리는 LiDAR odometry를 포즈 추정 Fisher Information 최대화 문제로 정식화한다. 이 최적화는 세 독립적인 subproblem으로 분해되며, 각각이 자연스럽게 C1(적응형 복셀화), C2(intensity 증강), C3(분포 전파)로 귀결된다."
+> "우리는 LiDAR odometry를 포즈 추정 Fisher Information 최대화 문제로 정식화한다. 이 최적화는 C1(FIM 가중치), C2(intensity 증강), C3(엔트로피 일관된 기하/강도 비중)로 귀결된다. 슬라이딩 윈도우 사용 시 분포 전파로 맵 갱신 효율화 가능."
 
 ---
 

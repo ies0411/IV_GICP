@@ -1,0 +1,69 @@
+# IV-GICP Pipeline default hyperparameters.
+# All pipeline/registration parameters; override per-dataset via datasets.yaml params.
+
+# Adaptive voxelization (C1)
+voxel_size: 1.0
+intensity_range_correction: false
+entropy_threshold: 2.0
+intensity_var_threshold: 100.0
+min_points_per_voxel: 3
+max_depth: 6
+adaptive_voxelization: true
+adaptive_max_depth: 2
+min_eigenvalue_ratio: 0.0
+max_condition_number: 0.0
+
+# IV-GICP registration
+alpha: 0.1
+max_correspondence_distance: 2.0
+max_iterations: 24
+initial_threshold: 2.0
+min_motion_th: 0.1
+huber_delta: 1.0
+
+# Preprocessing
+min_range: 0.5
+max_range: 80.0
+source_voxel_size: 0.5
+
+# Map management
+max_map_points: 100000
+max_map_frames: null  # auto from max_map_points if null
+map_radius: null
+kdtree_interval: 4  # rebuild target KDTree every N frames (higher = faster, slightly staler map)
+
+# Multi-scale (outdoor)
+coarse_voxel_size: 0.0
+coarse_iterations: 10
+coarse_max_corr: 0.0
+
+# Window smoothing
+window_size: 1
+
+# C2 / auto_alpha
+use_conditional_intensity: false
+intensity_gradient_threshold: 1.0e-6
+auto_alpha_from_intensity: true
+auto_alpha: true
+kappa_threshold: 10.0
+kappa_scale: 7.0
+alpha_floor_ratio: 0.2
+
+# C1/C3 (ablation)
+use_fim_weight: false
+use_entropy_alpha: false
+entropy_scale_c: 0.5
+
+# Distribution propagation
+use_distribution_propagation: true
+
+# Device
+device: "auto"
+
+# Theory reinforcements
+well_posed_polish: false
+well_posed_kappa_threshold: 100.0
+well_posed_max_iters: 2
+use_degeneracy_aware_intensity_weight: false
+degeneracy_kappa_threshold: 10.0
+use_coarse_for_convergence: false

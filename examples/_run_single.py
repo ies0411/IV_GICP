@@ -80,10 +80,14 @@ def run_genz_proxy(frames, gt, device):
         ts.append(time.perf_counter() - t0)
         poses.append(p.get_trajectory().poses[-1].copy())
         try:
-            leaves = p.adaptive_map.get_leaves()
+            leaves = (p.flat_map.leaves if p.flat_map is not None else [])
             if leaves:
-                covs = np.array([v.covariance for v in leaves
-                                 if getattr(v, "covariance", None) is not None])
+                covs = np.array([
+                    getattr(v.stats, "cov", None) or getattr(v, "covariance", None)
+                    for v in leaves
+                    if (getattr(v, "stats", None) and getattr(v.stats, "cov", None) is not None)
+                    or getattr(v, "covariance", None) is not None
+                ])
                 if len(covs) > 0:
                     H_t = np.sum(np.linalg.pinv(covs[:, :3, :3] + np.eye(3)*1e-6), axis=0)
                     H6  = np.block([[np.eye(3)*1e-3, np.zeros((3,3))],

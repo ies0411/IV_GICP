@@ -124,10 +124,9 @@ def update_stats_incremental(
     else:
         cov_batch = np.eye(3) * 1e-6
 
-    cov_new = (
-        (n_old - 1) * stats.cov + (m - 1) * cov_batch
-        + (n_old * m / n_new) * np.outer(delta, delta)
-    ) / (n_new - 1)
+    cov_new = ((n_old - 1) * stats.cov + (m - 1) * cov_batch + (n_old * m / n_new) * np.outer(delta, delta)) / (
+        n_new - 1
+    )
 
     # Intensity update
     sum_i_old = stats.mean_intensity * n_old
@@ -140,10 +139,9 @@ def update_stats_incremental(
         var_batch = float(np.var(new_intensity))
     else:
         var_batch = 0.0
-    var_i_new = (
-        (n_old - 1) * stats.var_intensity + (m - 1) * var_batch
-        + (n_old * m / n_new) * delta_i ** 2
-    ) / max(n_new - 1, 1)
+    var_i_new = ((n_old - 1) * stats.var_intensity + (m - 1) * var_batch + (n_old * m / n_new) * delta_i**2) / max(
+        n_new - 1, 1
+    )
 
     return VoxelStats(
         mean=mean_new,
@@ -196,16 +194,24 @@ class OctreeNode:
 
         # Trial-split into octants
         hs = self.half_size / 2
-        offsets = np.array([
-            [-1, -1, -1], [-1, -1, 1], [-1, 1, -1], [-1, 1, 1],
-            [1, -1, -1], [1, -1, 1], [1, 1, -1], [1, 1, 1],
-        ])
+        offsets = np.array(
+            [
+                [-1, -1, -1],
+                [-1, -1, 1],
+                [-1, 1, -1],
+                [-1, 1, 1],
+                [1, -1, -1],
+                [1, -1, 1],
+                [1, 1, -1],
+                [1, 1, 1],
+            ]
+        )
         child_centers = self.center + offsets * hs
 
         # Vectorized: compute all 8 octant masks at once (no Python loop)
         # xyz (N, 3), child_centers (8, 3) → diffs (8, N, 3)
         diffs = np.abs(xyz[np.newaxis, :, :] - child_centers[:, np.newaxis, :])  # (8, N, 3)
-        masks = np.all(diffs <= hs + 1e-6, axis=2)   # (8, N) bool
+        masks = np.all(diffs <= hs + 1e-6, axis=2)  # (8, N) bool
 
         weighted_H_children = 0.0
         n_valid = 0
@@ -261,9 +267,7 @@ class OctreeNode:
         # raw entropy as fallback for clearly complex distributions
         H_abs_max = entropy_threshold + 5.0  # absolute entropy cap
         should_split = (
-            IG > entropy_threshold
-            or H_parent > H_abs_max
-            or self.stats.var_intensity > intensity_var_threshold
+            IG > entropy_threshold or H_parent > H_abs_max or self.stats.var_intensity > intensity_var_threshold
         )
 
         if not should_split:
@@ -271,15 +275,23 @@ class OctreeNode:
 
         # Split into 8 children
         hs = self.half_size / 2
-        offsets = np.array([
-            [-1, -1, -1], [-1, -1, 1], [-1, 1, -1], [-1, 1, 1],
-            [1, -1, -1], [1, -1, 1], [1, 1, -1], [1, 1, 1],
-        ])
+        offsets = np.array(
+            [
+                [-1, -1, -1],
+                [-1, -1, 1],
+                [-1, 1, -1],
+                [-1, 1, 1],
+                [1, -1, -1],
+                [1, -1, 1],
+                [1, 1, -1],
+                [1, 1, 1],
+            ]
+        )
         child_centers = self.center + offsets * hs
 
         # Vectorized: compute all 8 split masks at once
         diffs_split = np.abs(xyz[np.newaxis, :, :] - child_centers[:, np.newaxis, :])  # (8, N, 3)
-        masks_split = np.all(diffs_split <= hs + 1e-6, axis=2)   # (8, N) bool
+        masks_split = np.all(diffs_split <= hs + 1e-6, axis=2)  # (8, N) bool
 
         for k, cc in enumerate(child_centers):
             mask = masks_split[k]
@@ -291,9 +303,14 @@ class OctreeNode:
             child_stats = compute_voxel_stats(xyz_c, int_c, cov_c)
             child = OctreeNode(cc, hs, child_stats)
             child.subdivide(
-                xyz_c, int_c, cov_c,
-                entropy_threshold, intensity_var_threshold,
-                min_points, max_depth, depth + 1,
+                xyz_c,
+                int_c,
+                cov_c,
+                entropy_threshold,
+                intensity_var_threshold,
+                min_points,
+                max_depth,
+                depth + 1,
             )
             self.children.append(child)
 
@@ -422,12 +439,14 @@ class AdaptiveVoxelMap:
         out = []
         for leaf in self.leaves:
             if leaf.stats is not None:
-                out.append((
-                    leaf.stats.mean,
-                    leaf.stats.cov,
-                    leaf.stats.mean_intensity,
-                    leaf.stats.n_points,
-                ))
+                out.append(
+                    (
+                        leaf.stats.mean,
+                        leaf.stats.cov,
+                        leaf.stats.mean_intensity,
+                        leaf.stats.n_points,
+                    )
+                )
         return out
 
     def get_voxel_count(self) -> int:
@@ -469,9 +488,7 @@ class AdaptiveVoxelMap:
                 tr_geo = 0.0
 
             # Intensity FIM contribution: n · (1/σ_I²)
-            sigma_sq = build_photometric_sigma_sq(
-                s.var_intensity, voxel_size, alpha
-            )
+            sigma_sq = build_photometric_sigma_sq(s.var_intensity, voxel_size, alpha)
             tr_int = float(n / (sigma_sq + 1e-12))
 
             contributions.append([tr_geo, tr_int, n])
@@ -479,7 +496,7 @@ class AdaptiveVoxelMap:
         if not contributions:
             return np.zeros((0, 3))
 
-        arr = np.array(contributions)   # (V, 3): [tr_geo, tr_int, n_pts]
+        arr = np.array(contributions)  # (V, 3): [tr_geo, tr_int, n_pts]
         # Sort by total FIM contribution descending
         total = arr[:, 0] + arr[:, 1]
         arr = arr[np.argsort(-total)]

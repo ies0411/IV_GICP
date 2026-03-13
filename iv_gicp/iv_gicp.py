@@ -20,6 +20,7 @@ from scipy.spatial import cKDTree
 from dataclasses import dataclass, field
 
 from iv_gicp.fast_kdtree import FastKDTree
+from iv_gicp.se3_utils import se3_exp, transform_point
 from iv_gicp.gpu_backend import (
     get_device,
     batch_intensity_gradients,
@@ -31,62 +32,21 @@ from iv_gicp.gpu_backend import (
 # C++ core: full GN loop in Eigen (no Python/CUDA overhead per iteration)
 try:
     from iv_gicp.cpp import iv_gicp_core as _cpp_core
+
     _CPP_CORE_AVAILABLE = True
 except ImportError:
     _cpp_core = None
     _CPP_CORE_AVAILABLE = False
 
 
-# ─── Lie algebra helpers ──────────────────────────────────────────────────────
-
-def skew_symmetric(v: np.ndarray) -> np.ndarray:
-    """Skew-symmetric matrix from 3D vector."""
-    return np.array(
-        [
-            [0, -v[2], v[1]],
-            [v[2], 0, -v[0]],
-            [-v[1], v[0], 0],
-        ]
-    )
-
-
-def so3_exp(omega: np.ndarray) -> np.ndarray:
-    """Exponential map for SO(3) via Rodrigues formula."""
-    angle = np.linalg.norm(omega)
-    if angle < 1e-8:
-        return np.eye(3)
-    K = skew_symmetric(omega / angle)
-    return np.eye(3) + np.sin(angle) * K + (1 - np.cos(angle)) * (K @ K)
-
-
-def se3_exp(xi: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
-    """SE(3) exponential map. xi = [ω, v] (6D). Returns (R, t)."""
-    omega, v = xi[:3], xi[3:6]
-    R = so3_exp(omega)
-    angle = np.linalg.norm(omega)
-    if angle < 1e-8:
-        t = v.copy()
-    else:
-        J = (
-            np.eye(3)
-            + (1 - np.cos(angle)) / (angle**2) * skew_symmetric(omega)
-            + (angle - np.sin(angle)) / (angle**3) * (skew_symmetric(omega) @ skew_symmetric(omega))
-        )
-        t = J @ v
-    return R, t
-
-
-def transform_point(T: np.ndarray, p: np.ndarray) -> np.ndarray:
-    """T: (4,4), p: (3,) -> transformed point."""
-    return T[:3, :3] @ p[:3] + T[:3, 3]
-
-
 # ─── Data structures ──────────────────────────────────────────────────────────
+
 
 @dataclass
 class Voxel4D:
     """4D voxel: geometry + intensity, with precomputed intensity gradient."""
-    mean: np.ndarray           # (4,) [x, y, z, α·I]
+
+    mean: np.ndarray  # (4,) [x, y, z, α·I]
     precision: np.ndarray = field(default_factory=lambda: np.eye(4))
     # (4,4) precomputed C^{-1} (avoids repeated pinv in GN loop)
     cov: Optional[np.ndarray] = None
@@ -96,6 +56,7 @@ class Voxel4D:
 
 
 # ─── Covariance builders ──────────────────────────────────────────────────────
+
 
 def build_photometric_sigma_sq(
     intensity_var: float,
@@ -118,8 +79,8 @@ def build_photometric_sigma_sq(
         alpha:         intensity scaling constant (unit alignment)
     """
     eps_var = 1e-4  # prevents blow-up when intensity is perfectly uniform
-    grad_sq_proxy = intensity_var / (voxel_size ** 2 + 1e-9)  # ≈ |∇I|²
-    sigma_sq = alpha ** 2 / (grad_sq_proxy + eps_var)
+    grad_sq_proxy = intensity_var / (voxel_size**2 + 1e-9)  # ≈ |∇I|²
+    sigma_sq = alpha**2 / (grad_sq_proxy + eps_var)
     return float(np.clip(sigma_sq, sigma_min, sigma_max))
 
 
@@ -166,6 +127,7 @@ def build_combined_covariance(
 
 # ─── IV-GICP class ────────────────────────────────────────────────────────────
 
+
 class IVGICP:
     """
     Intensity-Augmented Voxelized GICP (IV-GICP).
@@ -182,15 +144,18 @@ class IVGICP:
 
     def __init__(
         self,
-        alpha: float = 0.1,                      # intensity scaling (unit alignment: ~range/max_I)
+        alpha: float = 0.1,  # intensity scaling (unit alignment: ~range/max_I)
         max_correspondence_distance: float = 2.0,
         max_iterations: int = 100,
         convergence_threshold: float = 1e-4,
-        min_voxel_size: float = 0.5,             # ℓ_v for σ_I² formula
-        n_intensity_grad_neighbors: int = 8,     # K for gradient estimation
-        huber_delta: float = 0.0,                # Huber threshold (0 = disabled)
-        source_sigma: float = 0.0,               # source point uncertainty [m]; 0 = target-only Omega
-        device: str = "auto",                    # 'auto'|'cuda'|'cpu'|None
+        min_voxel_size: float = 0.5,  # ℓ_v for σ_I² formula
+        n_intensity_grad_neighbors: int = 8,  # K for gradient estimation
+        huber_delta: float = 0.0,  # Huber threshold (0 = disabled)
+        source_sigma: float = 0.0,  # source point uncertainty [m]; 0 = target-only Omega
+        device: str = "auto",  # 'auto'|'cuda'|'cpu'|None
+        use_fim_weight: bool = False,  # C1: weight by FIM contribution v^T H_i v (Python path only)
+        use_degeneracy_aware_intensity_weight: bool = False,  # A.2: upweight intensity for correspondences that inform degenerate direction v
+        degeneracy_kappa_threshold: float = 10.0,  # when κ_geo >= this, apply degeneracy-aware intensity weighting
     ):
         self.alpha = alpha
         self.max_corr_dist = max_correspondence_distance
@@ -200,6 +165,9 @@ class IVGICP:
         self.n_grad_nbrs = n_intensity_grad_neighbors
         self.huber_delta = huber_delta
         self.source_sigma = source_sigma
+        self.use_fim_weight = use_fim_weight
+        self.use_degeneracy_aware_intensity_weight = use_degeneracy_aware_intensity_weight
+        self.degeneracy_kappa_threshold = degeneracy_kappa_threshold
         self._device = get_device(device)
         self._gpu_cache = TargetGPUCache(self._device)
 
@@ -233,7 +201,7 @@ class IVGICP:
         # Vectorized neighbor cleanup: index 0 is always self (querying cloud against itself).
         # Skip column 0, take next K columns; pad/clamp if fewer than K exist.
         K = self.n_grad_nbrs
-        clean_idx = all_nbr_idx[:, 1:]                     # (n, k_query-1) — drop self
+        clean_idx = all_nbr_idx[:, 1:]  # (n, k_query-1) — drop self
         k_got = clean_idx.shape[1]
         if k_got < K:
             # Pad by repeating last column
@@ -246,9 +214,7 @@ class IVGICP:
         if clean_idx.shape[1] < 3:
             return
 
-        grads = batch_intensity_gradients(
-            means_arr, intensities, clean_idx, self._device
-        )  # (n, 3)
+        grads = batch_intensity_gradients(means_arr, intensities, clean_idx, self._device)  # (n, 3)
 
         for i, v in enumerate(voxels_4d):
             v.intensity_gradient = grads[i]
@@ -273,10 +239,10 @@ class IVGICP:
         # ── Step 1: Vectorized voxel assignment ──────────────────────────────
         # Map each point to integer voxel key, sort for contiguous grouping.
         keys_arr = np.floor(pts / vs).astype(np.int64)  # (N, 3)
-        sort_idx = np.lexsort(keys_arr.T[::-1])          # sort by (x, y, z)
-        keys_s   = keys_arr[sort_idx]                    # (N, 3) sorted keys
-        pts_s    = pts[sort_idx]                         # (N, 3)
-        ints_s   = ints[sort_idx]                        # (N,)
+        sort_idx = np.lexsort(keys_arr.T[::-1])  # sort by (x, y, z)
+        keys_s = keys_arr[sort_idx]  # (N, 3) sorted keys
+        pts_s = pts[sort_idx]  # (N, 3)
+        ints_s = ints[sort_idx]  # (N,)
 
         _, inv_idx, counts = np.unique(
             keys_s, axis=0, return_inverse=True, return_counts=True
@@ -289,30 +255,30 @@ class IVGICP:
 
         # ── Step 2: Vectorized statistics via reduceat (cache-friendly) ───────
         # reduceat processes contiguous sorted groups — ~10x faster than add.at
-        means = np.add.reduceat(pts_s, bdry) / counts[:, np.newaxis]     # (V, 3)
+        means = np.add.reduceat(pts_s, bdry) / counts[:, np.newaxis]  # (V, 3)
 
-        centered = pts_s - means[inv_idx]                                 # (N, 3)
-        outer    = (centered[:, :, np.newaxis] * centered[:, np.newaxis, :])  # (N,3,3)
-        M2 = np.add.reduceat(outer.reshape(-1, 9), bdry).reshape(nv, 3, 3)   # (V,3,3)
+        centered = pts_s - means[inv_idx]  # (N, 3)
+        outer = centered[:, :, np.newaxis] * centered[:, np.newaxis, :]  # (N,3,3)
+        M2 = np.add.reduceat(outer.reshape(-1, 9), bdry).reshape(nv, 3, 3)  # (V,3,3)
 
-        mean_i = np.add.reduceat(ints_s, bdry) / counts                  # (V,)
-        ci     = ints_s - mean_i[inv_idx]
-        var_i  = np.add.reduceat(ci ** 2, bdry)                           # (V,)
+        mean_i = np.add.reduceat(ints_s, bdry) / counts  # (V,)
+        ci = ints_s - mean_i[inv_idx]
+        var_i = np.add.reduceat(ci**2, bdry)  # (V,)
 
         n_safe = np.maximum(counts - 1, 1)
-        covs  = M2 / n_safe[:, np.newaxis, np.newaxis]  # (V, 3, 3)
-        covs += 1e-6 * np.eye(3)[np.newaxis]             # regularize
-        var_i /= n_safe                                  # (V,)
+        covs = M2 / n_safe[:, np.newaxis, np.newaxis]  # (V, 3, 3)
+        covs += 1e-6 * np.eye(3)[np.newaxis]  # regularize
+        var_i /= n_safe  # (V,)
 
         # ── Step 3: Filter to voxels with ≥ 1 point ──────────────────────────
         # Accept singletons: cov=1e-6·I (point-to-point ICP constraint).
         # Requiring ≥ 2 leaves only ~3-4 voxels for small clouds (e.g. 300 pts
         # with 0.5m voxels), causing GN divergence due to degenerate matches.
-        valid    = counts >= 1
-        means_v  = means[valid]    # (V', 3)
-        covs_v   = covs[valid]     # (V', 3, 3)
-        mean_i_v = mean_i[valid]   # (V',)
-        var_i_v  = var_i[valid]    # (V',)
+        valid = counts >= 1
+        means_v = means[valid]  # (V', 3)
+        covs_v = covs[valid]  # (V', 3, 3)
+        mean_i_v = mean_i[valid]  # (V',)
+        var_i_v = var_i[valid]  # (V',)
         nv_v = int(np.sum(valid))
 
         if nv_v == 0:
@@ -320,7 +286,10 @@ class IVGICP:
 
         # ── Step 4: Batch GPU precision matrices ──────────────────────────────
         precisions = batch_precision_matrices(
-            covs_v, var_i_v, self.min_voxel_size, self.alpha,
+            covs_v,
+            var_i_v,
+            self.min_voxel_size,
+            self.alpha,
             source_sigma=self.source_sigma,
             device=self._device,
         )  # (V', 4, 4)
@@ -328,10 +297,7 @@ class IVGICP:
         # ── Step 5: Build Voxel4D list (V' iterations, not N) ─────────────────
         # Note: Voxel4D.cov unused in GN hot-path (only .precision and .mean used).
         means_4d = np.column_stack([means_v, self.alpha * mean_i_v])  # (V', 4)
-        voxels_4d = [
-            Voxel4D(mean=means_4d[i], precision=precisions[i])
-            for i in range(nv_v)
-        ]
+        voxels_4d = [Voxel4D(mean=means_4d[i], precision=precisions[i]) for i in range(nv_v)]
 
         tree = FastKDTree(means_v)
         self._compute_intensity_gradients(means_v, voxels_4d, tree)
@@ -350,10 +316,10 @@ class IVGICP:
         Register source to pre-built target arrays (C++ fast path).
         Bypasses Voxel4D extraction — arrays come directly from VoxelMap.build_target_arrays.
         """
-        target_means_4d   = np.ascontiguousarray(target_arrays["means_4d"],  dtype=np.float64)
-        target_precisions = np.ascontiguousarray(target_arrays["prec"],      dtype=np.float64)
-        target_grads      = np.ascontiguousarray(target_arrays["grads"],     dtype=np.float64)
-        means_3d          = np.ascontiguousarray(target_arrays["means_3d"],  dtype=np.float64)
+        target_means_4d = np.ascontiguousarray(target_arrays["means_4d"], dtype=np.float64)
+        target_precisions = np.ascontiguousarray(target_arrays["prec"], dtype=np.float64)
+        target_grads = np.ascontiguousarray(target_arrays["grads"], dtype=np.float64)
+        means_3d = np.ascontiguousarray(target_arrays["means_3d"], dtype=np.float64)
         self._gpu_cache.load(target_means_4d, target_precisions, target_grads)
 
         T = np.eye(4) if init_pose is None else np.array(init_pose, dtype=float)
@@ -361,9 +327,15 @@ class IVGICP:
         # The C++ GN path (iv_gicp_core) builds its own tree internally.
         tree = FastKDTree(means_3d)
         T, info = self._gauss_newton_vectorized(
-            src_xyz[:, :3], src_intensities,
-            means_3d, target_means_4d, target_precisions, target_grads,
-            tree, T, max_corr_dist=max_corr_dist,
+            src_xyz[:, :3],
+            src_intensities,
+            means_3d,
+            target_means_4d,
+            target_precisions,
+            target_grads,
+            tree,
+            T,
+            max_corr_dist=max_corr_dist,
         )
         return T, info
 
@@ -380,9 +352,9 @@ class IVGICP:
             target_precisions: (M, 4, 4) cached precision matrices C^{-1}
             target_grads: (M, 3) intensity gradients ∇μ_I
         """
-        target_means_4d   = np.array([v.mean for v in voxels_t])              # (M, 4)
-        target_precisions = np.array([v.precision for v in voxels_t])         # (M, 4, 4)
-        target_grads      = np.array([v.intensity_gradient for v in voxels_t]) # (M, 3)
+        target_means_4d = np.array([v.mean for v in voxels_t])  # (M, 4)
+        target_precisions = np.array([v.precision for v in voxels_t])  # (M, 4, 4)
+        target_grads = np.array([v.intensity_gradient for v in voxels_t])  # (M, 3)
         # Pre-transfer to GPU once (reused for all GN iterations in this call)
         self._gpu_cache.load(target_means_4d, target_precisions, target_grads)
         return target_means_4d, target_precisions, target_grads
@@ -427,25 +399,26 @@ class IVGICP:
         info = {"iterations": 0, "n_correspondences": 0, "converged": False}
         H = None  # Hessian from last GN iteration (None if no correspondences found)
 
-        # ── C++ fast path: full GN loop in Eigen (no Python/CUDA overhead) ───
+        # ── C++ fast path: full GN loop in Eigen (C1 FIM weight supported in C++ when use_fim_weight) ───
         if _CPP_CORE_AVAILABLE:
             result = _cpp_core.icp_register(
-                np.ascontiguousarray(src_xyz,          dtype=np.float64),
-                np.ascontiguousarray(src_intensities,  dtype=np.float64),
-                np.ascontiguousarray(target_means_4d,  dtype=np.float64),
+                np.ascontiguousarray(src_xyz, dtype=np.float64),
+                np.ascontiguousarray(src_intensities, dtype=np.float64),
+                np.ascontiguousarray(target_means_4d, dtype=np.float64),
                 np.ascontiguousarray(target_precisions.reshape(n_target, 4, 4), dtype=np.float64),
-                np.ascontiguousarray(target_grads,     dtype=np.float64),
-                np.ascontiguousarray(means_t,          dtype=np.float64),
-                np.ascontiguousarray(T,                dtype=np.float64),
+                np.ascontiguousarray(target_grads, dtype=np.float64),
+                np.ascontiguousarray(means_t, dtype=np.float64),
+                np.ascontiguousarray(T, dtype=np.float64),
                 float(corr_dist),
                 float(self.alpha),
                 int(self.max_iter),
                 float(self.huber_delta),
                 6,  # min_valid
+                bool(self.use_fim_weight),
             )
-            info["iterations"]       = result["iterations"]
+            info["iterations"] = result["iterations"]
             info["n_correspondences"] = result["n_valid"]
-            info["converged"]        = result["converged"]
+            info["converged"] = result["converged"]
             if result["n_valid"] >= 6:
                 info["hessian"] = result["H"]
             return result["T"], info
@@ -459,9 +432,7 @@ class IVGICP:
             src_transformed = (R_cur @ src_xyz.T).T + t_cur
 
             # 2. Batch KNN query
-            dists, indices = tree_t.query(
-                src_transformed, k=1, distance_upper_bound=corr_dist
-            )
+            dists, indices = tree_t.query(src_transformed, k=1, distance_upper_bound=corr_dist)
 
             # 3. Valid correspondence mask
             valid = (indices < n_target) & (dists <= corr_dist)
@@ -473,31 +444,104 @@ class IVGICP:
             info["n_correspondences"] = n_valid
 
             # 4. Gather all correspondence data (vectorized)
-            src_valid = src_xyz[valid_idx]                    # (M', 3)
-            src_trans_valid = src_transformed[valid_idx]      # (M', 3)
-            src_int_valid = src_intensities[valid_idx]        # (M',)
-            tidx = indices[valid_idx]                         # (M',)
+            src_valid = src_xyz[valid_idx]  # (M', 3)
+            src_trans_valid = src_transformed[valid_idx]  # (M', 3)
+            src_int_valid = src_intensities[valid_idx]  # (M',)
+            tidx = indices[valid_idx]  # (M',)
 
             # 5-7. Residuals + Jacobians + Hessian (GPU or numpy)
             # target arrays gathered from GPU cache by correspondence indices
             t_means_g, t_prec_g, t_grad_g = self._gpu_cache.gather(tidx)
+            t_means_np = t_means_g.cpu().numpy() if hasattr(t_means_g, "cpu") else t_means_g
+            t_prec_np = t_prec_g.cpu().numpy() if hasattr(t_prec_g, "cpu") else t_prec_g
 
-            # 8. Huber robust kernel: per-point downweighting of outlier correspondences.
-            # w_i = 1 if dist_i < delta (inlier), delta/dist_i otherwise (outlier).
-            # Passed into gn_hessian_gradient for exact per-point reweighting:
-            #   H = Σ w_i * J_i^T Ω_i J_i,  b = Σ w_i * J_i^T Ω_i d_i
+            # 8. Huber robust kernel on 4D Mahalanobis residual (r_i = sqrt(d_i^T Ω_i d_i)).
+            # Downweights geometry and intensity outliers consistently in 4D.
             if self.huber_delta > 0 and n_valid > 0:
-                huber_d = dists[valid_idx]
-                weights = np.where(huber_d < self.huber_delta,
-                                   np.ones(n_valid),
-                                   self.huber_delta / (huber_d + 1e-9))
+                d_xyz = src_trans_valid - t_means_np[:, :3]
+                d_i = self.alpha * src_int_valid - t_means_np[:, 3]
+                d_4d = np.column_stack([d_xyz, d_i])
+                r_sq = np.einsum("mi,mij,mj->m", d_4d, t_prec_np, d_4d)
+                r = np.sqrt(np.maximum(r_sq, 0.0))
+                weights = np.where(r < self.huber_delta, np.ones(n_valid), self.huber_delta / (r + 1e-9))
             else:
                 weights = None
 
+            # 8b. C1: FIM-based per-voxel weight (v^T H_i v, v = min eig of I_G).
+            t_grad_np = t_grad_g.cpu().numpy() if hasattr(t_grad_g, "cpu") else t_grad_g
+            if self.use_fim_weight and n_valid >= 6:
+                I3 = np.eye(3)
+                Rp = src_trans_valid
+                J_xyz = np.zeros((n_valid, 3, 6), dtype=np.float64)
+                J_xyz[:, 0, 1] = Rp[:, 2]
+                J_xyz[:, 0, 2] = -Rp[:, 1]
+                J_xyz[:, 1, 0] = -Rp[:, 2]
+                J_xyz[:, 1, 2] = Rp[:, 0]
+                J_xyz[:, 2, 0] = Rp[:, 1]
+                J_xyz[:, 2, 1] = -Rp[:, 0]
+                J_xyz[:, :, 3:6] = I3[np.newaxis]
+                Omega_geo = t_prec_np[:, :3, :3]
+                I_G = np.einsum("mji,mjk,mkl->il", J_xyz, Omega_geo, J_xyz)
+                I_G = 0.5 * (I_G + I_G.T)
+                eigvals, eigvecs = np.linalg.eigh(I_G)
+                v = eigvecs[:, 0]
+                J_full = np.zeros((n_valid, 4, 6), dtype=np.float64)
+                J_full[:, :3, :] = J_xyz
+                J_full[:, 3, :] = -self.alpha * np.einsum("mi,mij->mj", t_grad_np, J_xyz)
+                H_all = np.einsum("mji,mjk,mkl->mil", J_full, t_prec_np, J_full)
+                w_fim = np.einsum("j,mjk,k->m", v, H_all, v)
+                w_fim = np.maximum(w_fim, 1e-12)
+                w_fim = w_fim / (np.mean(w_fim) + 1e-9)
+                if weights is not None:
+                    weights = weights * w_fim
+                else:
+                    weights = w_fim
+
+            # 8c. A.2 Degeneracy-aware intensity weighting (Proposition 1): when κ_geo >= threshold,
+            # upweight intensity residual for correspondences i with v^T (J_int_i^T J_int_i) v large.
+            if self.use_degeneracy_aware_intensity_weight and n_valid >= 6:
+                if not self.use_fim_weight:
+                    I3 = np.eye(3)
+                    Rp = src_trans_valid
+                    J_xyz = np.zeros((n_valid, 3, 6), dtype=np.float64)
+                    J_xyz[:, 0, 1] = Rp[:, 2]
+                    J_xyz[:, 0, 2] = -Rp[:, 1]
+                    J_xyz[:, 1, 0] = -Rp[:, 2]
+                    J_xyz[:, 1, 2] = Rp[:, 0]
+                    J_xyz[:, 2, 0] = Rp[:, 1]
+                    J_xyz[:, 2, 1] = -Rp[:, 0]
+                    J_xyz[:, :, 3:6] = I3[np.newaxis]
+                    Omega_geo = t_prec_np[:, :3, :3]
+                    I_G = np.einsum("mji,mjk,mkl->il", J_xyz, Omega_geo, J_xyz)
+                    I_G = 0.5 * (I_G + I_G.T)
+                    eigvals, eigvecs = np.linalg.eigh(I_G)
+                    v = eigvecs[:, 0]
+                else:
+                    # v already set above from I_G
+                    pass
+                lam_min, lam_max = float(np.min(eigvals)), float(np.max(eigvals))
+                kappa_geo = lam_max / max(lam_min, 1e-15)
+                if kappa_geo >= self.degeneracy_kappa_threshold:
+                    # J_int_i = -alpha * (grad_i^T J_xyz_i) -> (6,) per point; J_int (n_valid, 6)
+                    J_int = -self.alpha * np.einsum("mi,mij->mj", t_grad_np, J_xyz)
+                    # w_i = (J_int_i @ v)^2 = contribution of intensity to I_total along v
+                    w_degen = np.einsum("mj,j->m", J_int, v) ** 2
+                    w_degen = np.maximum(w_degen, 1e-12)
+                    w_degen = w_degen / (np.mean(w_degen) + 1e-9)
+                    if weights is not None:
+                        weights = weights * w_degen
+                    else:
+                        weights = w_degen
+
             H, b = gn_hessian_gradient(
-                src_trans_valid, src_int_valid,
-                t_means_g, t_prec_g, t_grad_g,
-                R_cur, self.alpha, self._device,
+                src_trans_valid,
+                src_int_valid,
+                t_means_g,
+                t_prec_g,
+                t_grad_g,
+                R_cur,
+                self.alpha,
+                self._device,
                 weights=weights,
             )
 
@@ -555,15 +599,9 @@ class IVGICP:
             raise ValueError("Points must have at least 3 dimensions (x, y, z)")
 
         if source_intensities is None:
-            source_intensities = (
-                source_points[:, 3] if source_points.shape[1] >= 4
-                else np.zeros(len(source_points))
-            )
+            source_intensities = source_points[:, 3] if source_points.shape[1] >= 4 else np.zeros(len(source_points))
         if target_intensities is None:
-            target_intensities = (
-                target_points[:, 3] if target_points.shape[1] >= 4
-                else np.zeros(len(target_points))
-            )
+            target_intensities = target_points[:, 3] if target_points.shape[1] >= 4 else np.zeros(len(target_points))
 
         # Build 4D target voxel map with precomputed intensity gradients
         means_t, voxels_t, tree_t = self._build_target_map(target_points, target_intensities)
@@ -574,9 +612,14 @@ class IVGICP:
         T = np.eye(4) if init_pose is None else np.array(init_pose, dtype=float)
 
         T, _ = self._gauss_newton_vectorized(
-            source_points[:, :3], source_intensities,
-            means_t, target_means_4d, target_precisions, target_grads,
-            tree_t, T,
+            source_points[:, :3],
+            source_intensities,
+            means_t,
+            target_means_4d,
+            target_precisions,
+            target_grads,
+            tree_t,
+            T,
         )
         return T
 
@@ -591,7 +634,7 @@ class IVGICP:
         max_corr_dist: Optional[float] = None,
     ) -> Tuple[np.ndarray, dict]:
         """
-        Register source to a pre-built voxel map (from AdaptiveVoxelMap).
+        Register source to a pre-built voxel map (from FlatVoxelMap/AdaptiveFlatVoxelMap or C++ VoxelMap).
 
         This avoids rebuilding the target voxel grid and allows adaptive
         voxel statistics (variable-resolution covariances) to be used directly.
@@ -611,9 +654,14 @@ class IVGICP:
         target_means_4d, target_precisions, target_grads = self._precompute_target_arrays(target_voxels)
         T = np.eye(4) if init_pose is None else np.array(init_pose, dtype=float)
         T, info = self._gauss_newton_vectorized(
-            source_points[:, :3], source_intensities,
-            target_means_3d, target_means_4d, target_precisions, target_grads,
-            target_tree, T,
+            source_points[:, :3],
+            source_intensities,
+            target_means_3d,
+            target_means_4d,
+            target_precisions,
+            target_grads,
+            target_tree,
+            T,
             max_corr_dist=max_corr_dist,
         )
         return T, info

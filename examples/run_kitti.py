@@ -30,11 +30,16 @@ from iv_gicp.metrics import compute_ate, compute_rpe, compute_rpe_kitti
 def main():
     parser = argparse.ArgumentParser(description="IV-GICP KITTI Evaluation")
     parser.add_argument(
-        "--data", type=str, default="data/kitti/sample",
+        "--data",
+        type=str,
+        default="data/kitti/sample",
         help="KITTI data root directory",
     )
     parser.add_argument(
-        "--format", type=str, choices=["raw", "odometry"], default="raw",
+        "--format",
+        type=str,
+        choices=["raw", "odometry"],
+        default="raw",
         help="KITTI data format (raw: velodyne_points+oxts, odometry: sequences+poses)",
     )
     parser.add_argument("--seq", type=str, default="00", help="Sequence ID (odometry format)")
@@ -59,11 +64,16 @@ def main():
     print(f"Loading KITTI ({args.format}) from {data_path}...")
     if args.format == "odometry":
         frames, poses_gt = load_kitti_odometry_sequence(
-            str(data_path), args.seq, args.max_frames, downsample=args.downsample,
+            str(data_path),
+            args.seq,
+            args.max_frames,
+            downsample=args.downsample,
         )
     else:
         frames, poses_gt = load_kitti_sequence(
-            str(data_path), args.max_frames, downsample=args.downsample,
+            str(data_path),
+            args.max_frames,
+            downsample=args.downsample,
         )
 
     print(f"  Loaded {len(frames)} frames")
@@ -92,7 +102,14 @@ def main():
         frame_times.append(dt)
 
         if i == 0:
-            print(f"  Frame {i}: Map built, {pipeline.adaptive_map.get_voxel_count()} voxels ({dt:.2f}s)")
+            if pipeline.flat_map is not None:
+                n_voxels = len(pipeline.flat_map.leaves)
+                print(f"  Frame {i}: Map built, {n_voxels} voxels ({dt:.2f}s)")
+            elif getattr(pipeline, "_cpp_voxel_map", None) is not None:
+                n_voxels = len(pipeline._cpp_voxel_map)
+                print(f"  Frame {i}: Map built (C++), {n_voxels} voxels ({dt:.2f}s)")
+            else:
+                print(f"  Frame {i}: Map built ({dt:.2f}s)")
         elif i % 20 == 0 or i == len(frames) - 1:
             t = result.pose[:3, 3]
             print(f"  Frame {i}: [{t[0]:.2f}, {t[1]:.2f}, {t[2]:.2f}] ({dt:.2f}s)")
@@ -171,8 +188,11 @@ def main():
 
     # Figures
     from iv_gicp.visualize import save_all_figures
+
     save_all_figures(
-        pipeline, str(out), fmt="png",
+        pipeline,
+        str(out),
+        fmt="png",
         use_open3d_3d=not args.no_open3d_3d,
         poses_gt=poses_gt,
     )

@@ -40,18 +40,20 @@ def _eval(poses, poses_gt, frame_times, label, extra=None):
     result = {"label": label, "n_frames": len(poses)}
     if poses_gt is not None and len(poses_gt) == len(poses):
         ate_rmse, ate_mean, _ = compute_ate(poses, poses_gt, align=True)
-        rpe_rmse, rpe_mean    = compute_rpe(poses, poses_gt)
-        kitti_m               = compute_rpe_kitti(poses, poses_gt)
-        result.update({
-            "ate_rmse":          round(ate_rmse, 4),
-            "ate_mean":          round(ate_mean, 4),
-            "rpe_rmse":          round(rpe_rmse, 4),
-            "rpe_mean":          round(rpe_mean, 4),
-            "kitti_t_err_pct":   round(kitti_m.get("t_err_pct", float("nan")), 4),
-            "kitti_r_err_deg_m": round(kitti_m.get("r_err_deg_m", float("nan")), 6),
-        })
-    result["avg_frame_ms"]  = round(np.mean(frame_times) * 1000, 1)
-    result["total_time_s"]  = round(sum(frame_times), 2)
+        rpe_rmse, rpe_mean = compute_rpe(poses, poses_gt)
+        kitti_m = compute_rpe_kitti(poses, poses_gt)
+        result.update(
+            {
+                "ate_rmse": round(ate_rmse, 4),
+                "ate_mean": round(ate_mean, 4),
+                "rpe_rmse": round(rpe_rmse, 4),
+                "rpe_mean": round(rpe_mean, 4),
+                "kitti_t_err_pct": round(kitti_m.get("t_err_pct", float("nan")), 4),
+                "kitti_r_err_deg_m": round(kitti_m.get("r_err_deg_m", float("nan")), 6),
+            }
+        )
+    result["avg_frame_ms"] = round(np.mean(frame_times) * 1000, 1)
+    result["total_time_s"] = round(sum(frame_times), 2)
     if extra:
         result.update(extra)
     return result
@@ -81,13 +83,22 @@ def run_kiss_icp(frames_xyz, poses_gt):
     cfg = KISSConfig()
     cfg.data.max_range = 80.0
     cfg.data.min_range = 2.0
+    cfg.data.deskew = False
     cfg.mapping.voxel_size = 1.0
     kiss = KissICP(config=cfg)
 
     poses, frame_times = [], []
-    for pts in frames_xyz:
+    for i, pts in enumerate(frames_xyz):
+        pts = np.asarray(pts, dtype=np.float64)
+        valid = np.isfinite(pts).all(axis=1)
+        pts = pts[valid]
+        if pts.shape[0] < 100:
+            poses.append(poses[-1].copy() if poses else np.eye(4))
+            frame_times.append(0.0)
+            continue
+        timestamps = np.full(pts.shape[0], float(i), dtype=np.float64)
         t0 = time.perf_counter()
-        kiss.register_frame(pts, np.zeros(len(pts)))
+        kiss.register_frame(pts, timestamps)
         frame_times.append(time.perf_counter() - t0)
         poses.append(kiss.last_pose.copy())
 
@@ -114,14 +125,13 @@ def run_genz_proxy(frames_xyzI, poses_gt, device="auto"):
     GenZ-ICP proxy: geometry-only IV-GICP pipeline + per-frame κ tracking.
     Planarity ratio computed from voxel eigenvalue structure (local covariance).
     """
-    from iv_gicp.adaptive_voxelization import AdaptiveVoxelMap
     from iv_gicp import IVGICP
 
     pipeline = IVGICPPipeline(
         device=device,
-        alpha=0.0,                    # geometry only — no intensity
-        entropy_threshold=0.5,        # adaptive voxelization (like GenZ-ICP's adaptive threshold)
-        intensity_var_threshold=1e10, # disabled
+        alpha=0.0,  # geometry only — no intensity
+        entropy_threshold=0.5,  # adaptive voxelization (like GenZ-ICP's adaptive threshold)
+        intensity_var_threshold=1e10,  # disabled
         use_distribution_propagation=False,
         voxel_size=1.0,
         max_correspondence_distance=5.0,
@@ -139,18 +149,21 @@ def run_genz_proxy(frames_xyzI, poses_gt, device="auto"):
         frame_times.append(time.perf_counter() - t0)
         poses.append(pipeline.get_trajectory().poses[-1].copy())
 
-        # Per-frame κ (GenZ-ICP degeneracy metric)
-        # Approximate Hessian via voxel covariances in map
+        # Per-frame κ (GenZ-ICP degeneracy metric) via flat_map voxel covariances
         try:
-            leaves = pipeline.adaptive_map.get_leaves()
+            leaves = pipeline.flat_map.leaves if pipeline.flat_map is not None else []
             if leaves:
-                covs = np.array([v.covariance for v in leaves if v.covariance is not None])
+                covs = np.array([
+                    getattr(v.stats, "cov", None) or getattr(v, "covariance", None)
+                    for v in leaves
+                    if (getattr(v, "stats", None) and getattr(v.stats, "cov", None) is not None)
+                    or getattr(v, "covariance", None) is not None
+                ])
                 if len(covs) > 0:
                     # Translational Hessian proxy: sum of precision matrices (xyz block)
                     H_trans = np.sum(np.linalg.pinv(covs[:, :3, :3] + np.eye(3) * 1e-6), axis=0)
                     kappa = genz_icp_condition_number(
-                        np.block([[np.eye(3) * 1e-3, np.zeros((3,3))],
-                                  [np.zeros((3,3)), H_trans]])
+                        np.block([[np.eye(3) * 1e-3, np.zeros((3, 3))], [np.zeros((3, 3)), H_trans]])
                     )
                     kappas.append(kappa)
 
@@ -163,11 +176,11 @@ def run_genz_proxy(frames_xyzI, poses_gt, device="auto"):
 
     extra = {}
     if kappas:
-        extra["genz_kappa_mean"]   = round(float(np.mean(kappas)), 2)
-        extra["genz_kappa_max"]    = round(float(np.max(kappas)), 2)
+        extra["genz_kappa_mean"] = round(float(np.mean(kappas)), 2)
+        extra["genz_kappa_max"] = round(float(np.max(kappas)), 2)
         extra["planarity_pct_mean"] = round(float(np.mean(planarity_ratios)) * 100, 1)
         # GenZ-ICP would flag degeneracy when κ > 100
-        extra["genz_deg_frames"]   = int(np.sum(np.array(kappas) > 100))
+        extra["genz_deg_frames"] = int(np.sum(np.array(kappas) > 100))
 
     return _eval(poses, poses_gt, frame_times, "GenZ-ICP (proxy)", extra)
 
@@ -177,6 +190,7 @@ def run_genz_proxy(frames_xyzI, poses_gt, device="auto"):
 # ──────────────────────────────────────────────────────────────────────────────
 def write_eval_md(ablation, comparison, args, n_frames, out_path):
     from datetime import date
+
     today = date.today().isoformat()
 
     L = []
@@ -202,10 +216,10 @@ def write_eval_md(ablation, comparison, args, n_frames, out_path):
 
     flags = [
         (False, False, False),
-        (True,  False, False),
-        (False, True,  False),
-        (True,  True,  False),
-        (True,  True,  True),
+        (True, False, False),
+        (False, True, False),
+        (True, True, False),
+        (True, True, True),
     ]
     for m, (ada, inten, dp) in zip(ablation, flags):
         ate = f"{m['ate_rmse']:.4f}" if "ate_rmse" in m else "N/A"
@@ -242,20 +256,17 @@ def write_eval_md(ablation, comparison, args, n_frames, out_path):
     ]
 
     method_flags = {
-        "GICP Baseline":   ("✗", "✗"),
-        "IV-GICP (Full)":  ("✓", "✓"),
-        "KISS-ICP":        ("✗", "✓ (adaptive thresh.)"),
-        "GenZ-ICP (proxy)":("✗", "✓ (entropy-based)"),
+        "GICP Baseline": ("✗", "✗"),
+        "IV-GICP (Full)": ("✓", "✓"),
+        "KISS-ICP": ("✗", "✓ (adaptive thresh.)"),
+        "GenZ-ICP (proxy)": ("✗", "✓ (entropy-based)"),
     }
     for m in comparison:
         lbl = m["label"]
         inten, ada = method_flags.get(lbl, ("?", "?"))
         ate = f"{m['ate_rmse']:.4f}" if "ate_rmse" in m else "N/A"
         rpe = f"{m['rpe_rmse']:.4f}" if "rpe_rmse" in m else "N/A"
-        L.append(
-            f"| **{lbl}** | {inten} | {ada} "
-            f"| {ate} | {rpe} | {m['avg_frame_ms']:.0f} |"
-        )
+        L.append(f"| **{lbl}** | {inten} | {ada} " f"| {ate} | {rpe} | {m['avg_frame_ms']:.0f} |")
 
     # GenZ proxy extra info
     genz = next((m for m in comparison if "GenZ" in m["label"]), None)
@@ -275,7 +286,7 @@ def write_eval_md(ablation, comparison, args, n_frames, out_path):
 
     # Speed analysis
     kiss_ms = next((m["avg_frame_ms"] for m in comparison if "KISS" in m["label"]), None)
-    iv_ms   = next((m["avg_frame_ms"] for m in comparison if m["label"] == "IV-GICP (Full)"), None)
+    iv_ms = next((m["avg_frame_ms"] for m in comparison if m["label"] == "IV-GICP (Full)"), None)
     if kiss_ms and iv_ms:
         ratio = iv_ms / kiss_ms
         L += [
@@ -296,8 +307,7 @@ def write_eval_md(ablation, comparison, args, n_frames, out_path):
         L += [
             f"\n- **IV-GICP vs KISS-ICP 속도:** IV-GICP ({iv_ms:.0f} ms) = "
             f"KISS-ICP ({kiss_ms:.0f} ms) × {ratio:.0f}. 구현 언어(Python vs C++) 차이가 주요 원인.",
-            "- GPU 가속으로 이전 CPU 11,715 ms → 현재 ~356 ms (32.9×). "
-            "C++ 이식 시 KISS-ICP 수준 달성 가능.",
+            "- GPU 가속으로 이전 CPU 11,715 ms → 현재 ~356 ms (32.9×). " "C++ 이식 시 KISS-ICP 수준 달성 가능.",
         ]
 
     # ── Distribution Propagation benchmark ────────────────────────────────────
@@ -351,21 +361,20 @@ def write_eval_md(ablation, comparison, args, n_frames, out_path):
 # ──────────────────────────────────────────────────────────────────────────────
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--data",       default="data/kitti/sample")
+    parser.add_argument("--data", default="data/kitti/sample")
     parser.add_argument("--max-frames", type=int, default=15)
     parser.add_argument("--downsample", type=int, default=5)
-    parser.add_argument("--device",     default="auto")
+    parser.add_argument("--device", default="auto")
     parser.add_argument("-o", "--output", default="docs/eval.md")
     args = parser.parse_args()
 
     data_path = Path(args.data)
     if not data_path.exists():
-        print(f"Error: {data_path} not found"); sys.exit(1)
+        print(f"Error: {data_path} not found")
+        sys.exit(1)
 
     print(f"Loading KITTI: {data_path} ({args.max_frames} frames, ds={args.downsample})")
-    frames_xyzI, poses_gt = load_kitti_sequence(
-        str(data_path), args.max_frames, downsample=args.downsample
-    )
+    frames_xyzI, poses_gt = load_kitti_sequence(str(data_path), args.max_frames, downsample=args.downsample)
     frames_xyz = [f[:, :3] for f in frames_xyzI]
     n = len(frames_xyzI)
     print(f"  {n} frames, ~{len(frames_xyzI[0])} pts/frame\n")
@@ -385,11 +394,26 @@ def main():
     print("=" * 60)
 
     ablation_configs = [
-        ("GICP Baseline",        dict(alpha=0.0, entropy_threshold=1e10, intensity_var_threshold=1e10, use_distribution_propagation=False)),
-        ("+ Adaptive only",      dict(alpha=0.0, entropy_threshold=0.5,  intensity_var_threshold=100., use_distribution_propagation=False)),
-        ("+ Intensity only",     dict(alpha=0.1, entropy_threshold=1e10, intensity_var_threshold=1e10, use_distribution_propagation=False)),
-        ("IV-GICP (no DP)",      dict(alpha=0.1, entropy_threshold=0.5,  intensity_var_threshold=0.01, use_distribution_propagation=False)),
-        ("IV-GICP (Full)",       dict(alpha=0.1, entropy_threshold=0.5,  intensity_var_threshold=0.01, use_distribution_propagation=True)),
+        (
+            "GICP Baseline",
+            dict(alpha=0.0, entropy_threshold=1e10, intensity_var_threshold=1e10, use_distribution_propagation=False),
+        ),
+        (
+            "+ Adaptive only",
+            dict(alpha=0.0, entropy_threshold=0.5, intensity_var_threshold=100.0, use_distribution_propagation=False),
+        ),
+        (
+            "+ Intensity only",
+            dict(alpha=0.1, entropy_threshold=1e10, intensity_var_threshold=1e10, use_distribution_propagation=False),
+        ),
+        (
+            "IV-GICP (no DP)",
+            dict(alpha=0.1, entropy_threshold=0.5, intensity_var_threshold=0.01, use_distribution_propagation=False),
+        ),
+        (
+            "IV-GICP (Full)",
+            dict(alpha=0.1, entropy_threshold=0.5, intensity_var_threshold=0.01, use_distribution_propagation=True),
+        ),
     ]
 
     ablation = []
@@ -422,8 +446,10 @@ def main():
     comparison.append(r)
     print(f"  ATE: {r.get('ate_rmse','N/A')} m  RPE: {r.get('rpe_rmse','N/A')} m  {r['avg_frame_ms']:.0f} ms/frame")
     if "genz_kappa_mean" in r:
-        print(f"  κ mean={r['genz_kappa_mean']}, max={r['genz_kappa_max']}, "
-              f"planarity={r.get('planarity_pct_mean','?')}%")
+        print(
+            f"  κ mean={r['genz_kappa_mean']}, max={r['genz_kappa_max']}, "
+            f"planarity={r.get('planarity_pct_mean','?')}%"
+        )
 
     # ── Summary ───────────────────────────────────────────────────────────────
     print(f"\n{'='*70}")
@@ -432,7 +458,7 @@ def main():
     for r in ablation + [c for c in comparison if c not in ablation]:
         ate = f"{r.get('ate_rmse',float('nan')):.4f}"
         rpe = f"{r.get('rpe_rmse',float('nan')):.4f}"
-        ms  = f"{r['avg_frame_ms']:.0f}"
+        ms = f"{r['avg_frame_ms']:.0f}"
         print(f"{r['label']:<30} {ate:>8} {rpe:>8} {ms:>7}")
 
     write_eval_md(ablation, comparison, args, n, Path(args.output))

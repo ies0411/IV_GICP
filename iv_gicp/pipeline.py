@@ -2,14 +2,13 @@
 IV-GICP Full Pipeline
 
 PointCloud → [range filter] → [constant-velocity prediction] →
-AdaptiveVoxelMap → IV-GICP registration →
+FlatVoxelMap/AdaptiveFlatVoxelMap (or C++ VoxelMap) → IV-GICP registration →
 (optional) FactorGraph → RetroactivePropagation or FORM-style update → RefinedMap
 
 Key improvements over draft:
   - Constant-velocity motion prediction for ICP initial pose (like KISS-ICP)
   - Range filtering to remove close-range noise and far-range outliers
   - Sliding-window map: limits accumulated points to prevent O(N·logN) rebuild growth
-  - AdaptiveVoxelMap.build() leaves list now properly reset between calls
 """
 
 import time
@@ -20,8 +19,7 @@ from dataclasses import dataclass, field
 
 from scipy.spatial import cKDTree
 
-from .adaptive_voxelization import AdaptiveVoxelMap
-from .flat_voxel_map import FlatVoxelMap, AdaptiveFlatVoxelMap, LocalKeyframeVoxelMap
+from .flat_voxel_map import FlatVoxelMap, AdaptiveFlatVoxelMap
 from .iv_gicp import IVGICP, Voxel4D, build_combined_covariance
 from .fast_kdtree import FastKDTree
 from .distribution_propagation import DistributionPropagator
@@ -31,23 +29,25 @@ from .gpu_backend import batch_precision_matrices, get_device
 
 try:
     from .cpp import iv_gicp_map as _cpp_map
+
     _CPP_MAP_AVAILABLE = True
 except ImportError:
     _cpp_map = None
     _CPP_MAP_AVAILABLE = False
 
+try:
+    from .cpp import iv_gicp_core as _cpp_core
+    _VOXEL_DOWNSPAMPLE_CPP = getattr(_cpp_core, "voxel_downsample", None)
+except ImportError:
+    _VOXEL_DOWNSPAMPLE_CPP = None
 
-def voxel_downsample(
+
+def _voxel_downsample_python(
     points: np.ndarray,
     intensities: np.ndarray,
     voxel_size: float,
 ) -> tuple:
-    """
-    Voxel-grid downsampling: centroid per voxel (KISS-ICP / PCL style).
-    O(N log N) via sort+reduceat. More stable than first-hit because
-    the centroid is the geometric center of all points in the voxel,
-    not an arbitrary first point that may be an outlier.
-    """
+    """Python fallback: voxel-grid downsampling (centroid per voxel)."""
     keys = (points[:, :3] / voxel_size).astype(np.int64)
     hashes = keys[:, 0] * 73856093 ^ keys[:, 1] * 19349663 ^ keys[:, 2] * 83492791
     order = np.argsort(hashes)
@@ -60,20 +60,39 @@ def voxel_downsample(
     return pts_centroids, ints_centroids
 
 
+def voxel_downsample(
+    points: np.ndarray,
+    intensities: np.ndarray,
+    voxel_size: float,
+) -> tuple:
+    """
+    Voxel-grid downsampling: centroid per voxel (KISS-ICP / PCL style).
+    Uses C++ implementation from iv_gicp_core if available, else Python fallback.
+    """
+    if _VOXEL_DOWNSPAMPLE_CPP is not None:
+        pts = np.asarray(points[:, :3], dtype=np.float64, order="C")
+        ints = np.asarray(intensities, dtype=np.float64, order="C")
+        out_pts, out_ints = _VOXEL_DOWNSPAMPLE_CPP(pts, ints, float(voxel_size))
+        return np.asarray(out_pts), np.asarray(out_ints)
+    return _voxel_downsample_python(points, intensities, voxel_size)
+
+
 @dataclass
 class OdometryResult:
     """Single frame odometry result."""
-    pose: np.ndarray                # 4×4 absolute pose (world ← sensor)
+
+    pose: np.ndarray  # 4×4 absolute pose (world ← sensor)
     timestamp: Optional[float] = None
     num_correspondences: int = 0
     # Per-phase timing (ms), 0.0 if not measured
-    reg_ms: float = 0.0     # ICP registration time
-    map_ms: float = 0.0     # map insert + optional KDTree rebuild time
+    reg_ms: float = 0.0  # ICP registration time
+    map_ms: float = 0.0  # map insert + optional KDTree rebuild time
 
 
 @dataclass
 class Trajectory:
     """Trajectory and map state."""
+
     poses: List[np.ndarray] = field(default_factory=list)
     timestamps: List[float] = field(default_factory=list)
     voxel_map_means: Optional[np.ndarray] = None
@@ -96,25 +115,28 @@ class IVGICPPipeline:
         entropy_threshold: float = 2.0,
         intensity_var_threshold: float = 100.0,
         min_points_per_voxel: int = 3,
-        max_depth: int = 6,           # reduced from 8 for speed
+        max_depth: int = 6,  # reduced from 8 for speed
         # IV-GICP registration
-        alpha: float = 0.1,           # corrected from 0.01: ~range/max_I
+        alpha: float = 0.1,  # corrected from 0.01: ~range/max_I
         max_correspondence_distance: float = 2.0,
         max_iterations: int = 32,
         # Adaptive threshold (KISS-ICP style sigma tracking)
-        initial_threshold: float = 2.0,    # initial correspondence distance sigma
-        min_motion_th: float = 0.1,        # ignore frames with motion < this (m)
+        initial_threshold: float = 2.0,  # initial correspondence distance sigma
+        min_motion_th: float = 0.1,  # ignore frames with motion < this (m)
         # Robust kernel
-        huber_delta: float = 1.0,          # Huber threshold; 0 = disabled
+        huber_delta: float = 1.0,  # Huber threshold; 0 = disabled
         # Preprocessing
-        min_range: float = 0.5,       # [m] remove close-range returns
-        max_range: float = 80.0,      # [m] remove far-range noise
+        min_range: float = 0.5,  # [m] remove close-range returns
+        max_range: float = 80.0,  # [m] remove far-range noise
         source_voxel_size: float = 0.5,  # [m] voxel downsample source scan (0 = disabled)
         # Map management
         max_map_points: int = 100_000,  # sliding window to bound rebuild cost
         max_map_frames: Optional[int] = None,  # override frame window (None = auto from max_map_points)
         map_radius: Optional[float] = None,  # [m] spatial eviction radius (None = age-based eviction)
         adaptive_voxelization: bool = True,  # C1: entropy-based coarse/fine split (slower but better for tunnels)
+        adaptive_max_depth: int = 2,  # C1: subdivision levels (1=coarse+fine, 2=coarse+mid+fine, …)
+        min_eigenvalue_ratio: float = 0.0,  # C1-only ablation: clamp leaf cov λ_min >= η·λ_max (e.g. 0.01); 0 = off
+        max_condition_number: float = 0.0,  # C1 보수적 분할: fine leaf κ > 이 값이면 coarse만 사용 (0 = 비활성, 예: 50~200)
         # Multi-scale registration
         # coarse_voxel_size > 0 enables two-level GICP:
         #   1. Coarse map (coarse_voxel_size): initial convergence, large search radius
@@ -122,58 +144,180 @@ class IVGICPPipeline:
         # Theoretical backing: multi-scale ICP reduces susceptibility to local minima
         # by providing a wide convergence basin at the coarse level, then refining
         # with fine voxels. See Chetverikov et al. 2002, Magnusson et al. 2009.
-        coarse_voxel_size: float = 0.0,   # 0 = disabled; e.g. 3.0 for outdoor
-        coarse_iterations: int = 10,       # GN iterations for coarse level
-        coarse_max_corr: float = 0.0,      # 0 = auto (3 × coarse_voxel_size)
+        coarse_voxel_size: float = 0.0,  # 0 = disabled; e.g. 3.0 for outdoor
+        coarse_iterations: int = 10,  # GN iterations for coarse level
+        coarse_max_corr: float = 0.0,  # 0 = auto (3 × coarse_voxel_size)
         # FORM-style fixed-lag window smoothing (Potokar et al. 2025)
         # window_size > 1 enables joint pose graph optimization over the K most
         # recent frames using ICP Hessians as factor information matrices.
         # Faster than GTSAM: uses our GN solver on a tiny (6K × 6K) linear system.
-        window_size: int = 1,   # 1 = disabled; typically 5-15 for real-time use
+        window_size: int = 1,  # 1 = disabled; typically 5-15 for real-time use
+        # C2: intensity scale from data so C2 doesn't hurt in uniform-intensity scenes (no fallback to GICP)
+        use_conditional_intensity: bool = False,  # if True: use geometry-only when mean(|∇I|) < threshold
+        intensity_gradient_threshold: float = 1e-6,
+        auto_alpha_from_intensity: bool = True,  # alpha = clip(robust_std(I), 1e-6, 1.0) from first frame when alpha>0
+        # C2 auto_alpha (Theorem 1): κ high → degenerate → use intensity; κ low → geometry-only
+        auto_alpha: bool = True,  # effective_alpha = alpha_max * sigmoid((κ - κ_thresh) / scale); default on
+        kappa_threshold: float = 10.0,  # κ above this → increase alpha (tunnel/degenerate); lowered from 15 for earlier intensity use
+        kappa_scale: float = 7.0,  # sigmoid steepness (gentler so alpha rises in mid-κ)
+        alpha_floor_ratio: float = 0.2,  # when κ > threshold, effective_alpha >= alpha_max * this (avoid too-weak intensity in degenerate)
         # Distribution propagation
         use_distribution_propagation: bool = True,
+        # C1: FIM-based per-voxel weighting (Python GN path only)
+        use_fim_weight: bool = False,
+        # C3: entropy-consistent geo/intensity balance (per-voxel omega_I scale; Python map path only)
+        use_entropy_alpha: bool = False,
+        entropy_scale_c: float = 0.5,  # scale = 1 + c * (h_geo - median(h_geo)), clipped [0.4, 2.5]; was 0.3 for stronger C3
+        # A.1 Well-posed polish: when κ_geo < threshold, refine with geometry-only 1–2 GN steps
+        well_posed_polish: bool = False,
+        well_posed_kappa_threshold: float = 100.0,
+        well_posed_max_iters: int = 2,
         # GPU acceleration
         device: str = "auto",
     ):
-        self._device = get_device(device)
-        # Keep AdaptiveVoxelMap for offline analysis / ablation study.
-        # Real-time odometry now uses FlatVoxelMap (O(N_frame) per update).
-        self.adaptive_map = AdaptiveVoxelMap(
+        # Merge config from YAML (if present) so callers can rely on config/ for defaults
+        try:
+            from .config_loader import get_pipeline_config
+            _file_cfg = get_pipeline_config()
+        except Exception:
+            _file_cfg = {}
+        _opts = dict(
             voxel_size=voxel_size,
+            intensity_range_correction=intensity_range_correction,
             entropy_threshold=entropy_threshold,
             intensity_var_threshold=intensity_var_threshold,
             min_points_per_voxel=min_points_per_voxel,
             max_depth=max_depth,
+            alpha=alpha,
+            max_correspondence_distance=max_correspondence_distance,
+            max_iterations=max_iterations,
+            initial_threshold=initial_threshold,
+            min_motion_th=min_motion_th,
+            huber_delta=huber_delta,
+            min_range=min_range,
+            max_range=max_range,
+            source_voxel_size=source_voxel_size,
+            max_map_points=max_map_points,
+            max_map_frames=max_map_frames,
+            map_radius=map_radius,
+            adaptive_voxelization=adaptive_voxelization,
+            adaptive_max_depth=adaptive_max_depth,
+            min_eigenvalue_ratio=min_eigenvalue_ratio,
+            max_condition_number=max_condition_number,
+            coarse_voxel_size=coarse_voxel_size,
+            coarse_iterations=coarse_iterations,
+            coarse_max_corr=coarse_max_corr,
+            window_size=window_size,
+            use_conditional_intensity=use_conditional_intensity,
+            intensity_gradient_threshold=intensity_gradient_threshold,
+            auto_alpha_from_intensity=auto_alpha_from_intensity,
+            auto_alpha=auto_alpha,
+            kappa_threshold=kappa_threshold,
+            kappa_scale=kappa_scale,
+            alpha_floor_ratio=alpha_floor_ratio,
+            use_distribution_propagation=use_distribution_propagation,
+            use_fim_weight=use_fim_weight,
+            use_entropy_alpha=use_entropy_alpha,
+            entropy_scale_c=entropy_scale_c,
+            well_posed_polish=well_posed_polish,
+            well_posed_kappa_threshold=well_posed_kappa_threshold,
+            well_posed_max_iters=well_posed_max_iters,
+            use_degeneracy_aware_intensity_weight=False,
+            degeneracy_kappa_threshold=10.0,
+            use_coarse_for_convergence=False,
+            kdtree_interval=3,
+            device=device,
         )
+        _opts = {**_opts, **_file_cfg}
+        voxel_size = _opts["voxel_size"]
+        intensity_range_correction = _opts["intensity_range_correction"]
+        entropy_threshold = _opts["entropy_threshold"]
+        intensity_var_threshold = _opts["intensity_var_threshold"]
+        min_points_per_voxel = _opts["min_points_per_voxel"]
+        max_depth = _opts["max_depth"]
+        alpha = _opts["alpha"]
+        max_correspondence_distance = _opts["max_correspondence_distance"]
+        max_iterations = _opts["max_iterations"]
+        initial_threshold = _opts["initial_threshold"]
+        min_motion_th = _opts["min_motion_th"]
+        huber_delta = _opts["huber_delta"]
+        min_range = _opts["min_range"]
+        max_range = _opts["max_range"]
+        source_voxel_size = _opts["source_voxel_size"]
+        max_map_points = _opts["max_map_points"]
+        max_map_frames = _opts["max_map_frames"]
+        map_radius = _opts["map_radius"]
+        adaptive_voxelization = _opts["adaptive_voxelization"]
+        adaptive_max_depth = _opts["adaptive_max_depth"]
+        min_eigenvalue_ratio = _opts["min_eigenvalue_ratio"]
+        max_condition_number = _opts["max_condition_number"]
+        coarse_voxel_size = _opts["coarse_voxel_size"]
+        coarse_iterations = _opts["coarse_iterations"]
+        coarse_max_corr = _opts["coarse_max_corr"]
+        window_size = _opts["window_size"]
+        use_conditional_intensity = _opts["use_conditional_intensity"]
+        intensity_gradient_threshold = _opts["intensity_gradient_threshold"]
+        auto_alpha_from_intensity = _opts["auto_alpha_from_intensity"]
+        auto_alpha = _opts["auto_alpha"]
+        kappa_threshold = _opts["kappa_threshold"]
+        kappa_scale = _opts["kappa_scale"]
+        alpha_floor_ratio = _opts["alpha_floor_ratio"]
+        use_distribution_propagation = _opts["use_distribution_propagation"]
+        use_fim_weight = _opts["use_fim_weight"]
+        use_entropy_alpha = _opts["use_entropy_alpha"]
+        entropy_scale_c = _opts["entropy_scale_c"]
+        well_posed_polish = _opts.get("well_posed_polish", False)
+        well_posed_kappa_threshold = float(_opts.get("well_posed_kappa_threshold", 100.0))
+        well_posed_max_iters = int(_opts.get("well_posed_max_iters", 2))
+        use_degeneracy_aware_intensity_weight = _opts.get("use_degeneracy_aware_intensity_weight", False)
+        degeneracy_kappa_threshold = float(_opts.get("degeneracy_kappa_threshold", 10.0))
+        use_coarse_for_convergence = _opts.get("use_coarse_for_convergence", False)
+        kdtree_interval = int(_opts.get("kdtree_interval", 3))
+        device = _opts["device"]
+        if use_coarse_for_convergence and coarse_voxel_size <= 0:
+            coarse_voxel_size = 2.0  # A.3 default for outdoor convergence basin
+
+        self._well_posed_polish = well_posed_polish
+        self._well_posed_kappa_threshold = well_posed_kappa_threshold
+        self._well_posed_max_iters = well_posed_max_iters
+        self._device = get_device(device)
         # AdaptiveFlatVoxelMap (C1):
         #   C1: world-frame merged voxel map with entropy-based adaptive resolution.
         #       Coarse voxels for flat/simple regions, fine for complex geometry.
         #       Combined splitting score S = H_geo + λ·H_int > τ_split.
         #   World-frame merging (Welford) gives accurate multi-frame covariances
         #   essential for reliable GICP in degenerate scenes (tunnels, corridors).
-        # LocalKeyframeVoxelMap (C3) is kept for retroactive correction with a
+        # C3 retroactive correction would use LocalKeyframeVoxelMap (flat_voxel_map) if needed.
         # factor graph smoother (not yet integrated into the real-time odometry path).
         _map_frames = max_map_frames if max_map_frames is not None else max(max_map_points // 5000, 20)
-        # C++ VoxelMap: replaces Python FlatVoxelMap for insert_frame + build_target_arrays.
-        # Falls back to Python FlatVoxelMap if C++ module not built.
-        # AdaptiveFlatVoxelMap (C1) still uses Python path; C++ map = plain FlatVoxelMap equivalent.
-        if _CPP_MAP_AVAILABLE and not adaptive_voxelization:
-            self._cpp_voxel_map = _cpp_map.VoxelMap(voxel_size, min_points_per_voxel)
-            self._cpp_coarse_map = None  # set below if coarse enabled
+        # C++ map: VoxelMap (fixed) or AdaptiveVoxelMap (C1). Same interface: insert_frame, build_target_arrays, query_sigma.
+        # Falls back to Python FlatVoxelMap / AdaptiveFlatVoxelMap if C++ module not built.
+        if _CPP_MAP_AVAILABLE:
+            self._cpp_coarse_map = None  # set below if coarse enabled (non-adaptive only)
+            if adaptive_voxelization:
+                self._cpp_voxel_map = _cpp_map.AdaptiveVoxelMap(
+                    voxel_size,
+                    min_points_per_voxel,  # min_points_coarse
+                    2,  # min_points_fine
+                    _map_frames,
+                    entropy_threshold,
+                    0.1,  # lambda_intensity
+                    min_eigenvalue_ratio,
+                    max_condition_number,
+                    adaptive_max_depth,
+                )
+            else:
+                self._cpp_voxel_map = _cpp_map.VoxelMap(voxel_size, min_points_per_voxel)
             self.flat_map = None  # unused when C++ path active
         else:
             self._cpp_voxel_map = None
             self._cpp_coarse_map = None
             if adaptive_voxelization:
-                self.flat_map = AdaptiveFlatVoxelMap(
-                    base_voxel_size=voxel_size,
-                    min_points_coarse=min_points_per_voxel,
-                    max_frames=_map_frames,
-                    entropy_threshold=entropy_threshold,
-                    lambda_intensity=0.1,
+                raise RuntimeError(
+                    "adaptive_voxelization=True requires the C++ extension (iv_gicp.cpp.iv_gicp_map). "
+                    "Build with: python setup_cpp.py build_ext --inplace"
                 )
-            else:
-                self.flat_map = FlatVoxelMap(voxel_size, min_points_per_voxel, _map_frames)
+            self.flat_map = FlatVoxelMap(voxel_size, min_points_per_voxel, _map_frames)
         self._map_frames = _map_frames
         self.iv_gicp = IVGICP(
             alpha=alpha,
@@ -183,7 +327,12 @@ class IVGICPPipeline:
             huber_delta=huber_delta,
             source_sigma=source_voxel_size / 2.0,
             device=device,
+            use_fim_weight=use_fim_weight,
+            use_degeneracy_aware_intensity_weight=use_degeneracy_aware_intensity_weight,
+            degeneracy_kappa_threshold=degeneracy_kappa_threshold,
         )
+        self._use_entropy_alpha = use_entropy_alpha
+        self._entropy_scale_c = entropy_scale_c
 
         # Multi-scale: coarse map + ICP for better convergence basin
         self._coarse_map: Optional[FlatVoxelMap] = None
@@ -194,9 +343,11 @@ class IVGICPPipeline:
         self.coarse_voxel_size = coarse_voxel_size
         _coarse_max_corr = coarse_max_corr if coarse_max_corr > 0 else 3.0 * coarse_voxel_size
         self._coarse_max_corr = _coarse_max_corr
-        if coarse_voxel_size > 0:
+        # Coarse map: when adaptive is off, or when use_coarse_for_convergence (outdoor) is on.
+        # A.3: outdoor/wide-basin — coarse→fine improves convergence; can be used with adaptive.
+        if coarse_voxel_size > 0 and (not adaptive_voxelization or use_coarse_for_convergence):
             _coarse_map_frames = max(3, _map_frames // 3)
-            if _CPP_MAP_AVAILABLE and not adaptive_voxelization:
+            if _CPP_MAP_AVAILABLE:
                 self._cpp_coarse_map = _cpp_map.VoxelMap(coarse_voxel_size, 2)
                 self._coarse_map = None
             else:
@@ -229,7 +380,7 @@ class IVGICPPipeline:
 
         self.min_range = min_range
         self.max_range = max_range
-        self.map_radius = map_radius   # spatial eviction radius; None = age-based
+        self.map_radius = map_radius  # spatial eviction radius; None = age-based
         self.source_voxel_size = source_voxel_size
         self.max_map_points = max_map_points
         self.intensity_range_correction = intensity_range_correction
@@ -242,21 +393,34 @@ class IVGICPPipeline:
         self._adaptive_sigma = max_correspondence_distance / 3.0
         self._initial_threshold = initial_threshold
         self._min_motion_th = min_motion_th
+        self._use_conditional_intensity = use_conditional_intensity
+        self._intensity_gradient_threshold = intensity_gradient_threshold
+        self._auto_alpha_from_intensity = auto_alpha_from_intensity
+        self._auto_alpha = auto_alpha
+        self._kappa_threshold = kappa_threshold
+        self._kappa_scale = kappa_scale
+        self._alpha_floor_ratio = alpha_floor_ratio
+        self._alpha_max = alpha  # when auto_alpha, effective_alpha in [0, _alpha_max]
 
         self.trajectory = Trajectory()
         self.current_pose = np.eye(4)
-        self.map_voxels: Optional[List[tuple]] = None   # legacy (for C3 propagation)
+        self.map_voxels: Optional[List[tuple]] = None  # legacy (for C3 propagation)
         self.accumulated_points: Optional[np.ndarray] = None  # legacy (for ablation)
 
         # Cached registration targets (rebuilt from flat map)
         self._target_voxels_4d: Optional[List[Voxel4D]] = None
         self._target_means_3d: Optional[np.ndarray] = None
         self._target_tree: Optional[FastKDTree] = None
-        self._cpp_target_arrays: Optional[dict] = None   # raw arrays for C++ path
+        self._cpp_target_arrays: Optional[dict] = None  # raw arrays for C++ path
         self._frame_count: int = 0
         # Rebuild KDTree + Voxel4D only every _kdtree_interval frames.
         # Between rebuilds: use cached tree (slightly stale but fast).
-        self._kdtree_interval: int = 3
+        self._kdtree_interval = kdtree_interval
+        # auto_alpha: rebuild only when alpha changed enough or every N frames (speed).
+        self._last_auto_alpha: Optional[float] = None
+        self._last_alpha_rebuild_frame: int = -1
+        self._auto_alpha_rebuild_interval: int = 2
+        self._auto_alpha_change_threshold: float = 0.05
 
     def _prefilter(
         self,
@@ -347,18 +511,20 @@ class IVGICPPipeline:
                 alpha,
                 self.source_voxel_size / 2.0,
                 self.iv_gicp.n_grad_nbrs,
-                2.0,   # count_reg_scale (matches gpu_backend default)
+                2.0,  # count_reg_scale (matches gpu_backend default)
+                self._use_entropy_alpha,
+                self._entropy_scale_c,
             )
             V = len(arrays["means_4d"])
             if V == 0:
                 return
             # Cache raw arrays — skip Voxel4D creation entirely
             self._cpp_target_arrays = arrays
-            self._target_voxels_4d  = None   # unused in C++ path
-            self._target_means_3d   = arrays["means_3d"]
+            self._target_voxels_4d = None  # unused in C++ path
+            self._target_means_3d = arrays["means_3d"]
             # FastKDTree only needed for coarse adaptive sigma fallback.
             # Primary sigma update uses _cpp_voxel_map.query_sigma (no Python overhead).
-            self._target_tree = None   # will be built lazily if needed
+            self._target_tree = None  # will be built lazily if needed
             return
 
         # ── Python / GPU fallback ────────────────────────────────────────────
@@ -372,28 +538,39 @@ class IVGICPPipeline:
         if not leaf_stats:
             return
 
-        covs_arr   = np.array([s.cov for s, _ in leaf_stats])
-        var_i_arr  = np.array([s.var_intensity for s, _ in leaf_stats])
+        covs_arr = np.array([s.cov for s, _ in leaf_stats])
+        var_i_arr = np.array([s.var_intensity for s, _ in leaf_stats])
         vsizes_arr = np.array([vs for _, vs in leaf_stats])
-        n_counts   = np.array([s.n_points for s, _ in leaf_stats])
+        n_counts = np.array([s.n_points for s, _ in leaf_stats])
+
+        entropy_scale = None
+        if self._use_entropy_alpha:
+            _, log_det = np.linalg.slogdet(covs_arr + 1e-10 * np.eye(3))
+            h_geo = 0.5 * log_det
+            med = np.median(h_geo)
+            entropy_scale = 1.0 + self._entropy_scale_c * (h_geo - med)
+            entropy_scale = np.clip(entropy_scale, 0.4, 2.5).astype(np.float64)
 
         precisions = batch_precision_matrices(
-            covs_arr, var_i_arr, vsizes_arr, alpha,
+            covs_arr,
+            var_i_arr,
+            vsizes_arr,
+            alpha,
             source_sigma=self.source_voxel_size / 2.0,
             n_counts=n_counts,
+            entropy_scale=entropy_scale,
             device=self._device,
         )
 
         n = len(leaf_stats)
-        means_arr_4d = np.column_stack([
-            np.array([s.mean for s, _ in leaf_stats]),
-            alpha * np.array([s.mean_intensity for s, _ in leaf_stats]),
-        ])
+        means_arr_4d = np.column_stack(
+            [
+                np.array([s.mean for s, _ in leaf_stats]),
+                alpha * np.array([s.mean_intensity for s, _ in leaf_stats]),
+            ]
+        )
         means_3d = [s.mean for s, _ in leaf_stats]
-        voxels_4d = [
-            Voxel4D(mean=means_arr_4d[i], precision=precisions[i])
-            for i in range(n)
-        ]
+        voxels_4d = [Voxel4D(mean=means_arr_4d[i], precision=precisions[i]) for i in range(n)]
 
         if not means_3d:
             return
@@ -403,31 +580,29 @@ class IVGICPPipeline:
         self.iv_gicp._compute_intensity_gradients(means_arr, voxels_4d, tree)
 
         self._target_voxels_4d = voxels_4d
-        self._target_means_3d  = means_arr
-        self._target_tree      = tree
+        self._target_means_3d = means_arr
+        self._target_tree = tree
 
     def _build_coarse_voxels(self) -> None:
         """Build coarse-level Voxel4D targets from coarse FlatVoxelMap."""
         if self._cpp_coarse_map is not None:
             arrays = self._cpp_coarse_map.build_target_arrays(
-                0.0, self.source_voxel_size / 2.0,
-                self.iv_gicp.n_grad_nbrs, 2.0,
+                0.0,
+                self.source_voxel_size / 2.0,
+                self.iv_gicp.n_grad_nbrs,
+                2.0,
             )
             means_4d = arrays["means_4d"]
-            prec     = arrays["prec"]
-            grads    = arrays["grads"]
+            prec = arrays["prec"]
+            grads = arrays["grads"]
             means_3d = arrays["means_3d"]
             V = len(means_4d)
             if V == 0:
                 return
-            voxels_4d = [
-                Voxel4D(mean=means_4d[i], precision=prec[i],
-                        intensity_gradient=grads[i])
-                for i in range(V)
-            ]
+            voxels_4d = [Voxel4D(mean=means_4d[i], precision=prec[i], intensity_gradient=grads[i]) for i in range(V)]
             self._coarse_target_voxels_4d = voxels_4d
-            self._coarse_target_means_3d  = means_3d
-            self._coarse_target_tree      = FastKDTree(means_3d)
+            self._coarse_target_means_3d = means_3d
+            self._coarse_target_tree = FastKDTree(means_3d)
             return
 
         leaf_stats = []
@@ -440,28 +615,30 @@ class IVGICPPipeline:
         if not leaf_stats:
             return
 
-        covs_arr   = np.array([s.cov for s, _ in leaf_stats])
-        var_i_arr  = np.array([s.var_intensity for s, _ in leaf_stats])
+        covs_arr = np.array([s.cov for s, _ in leaf_stats])
+        var_i_arr = np.array([s.var_intensity for s, _ in leaf_stats])
         vsizes_arr = np.array([vs for _, vs in leaf_stats])
-        n_counts   = np.array([s.n_points for s, _ in leaf_stats])
+        n_counts = np.array([s.n_points for s, _ in leaf_stats])
 
         precisions = batch_precision_matrices(
-            covs_arr, var_i_arr, vsizes_arr, 0.0,
+            covs_arr,
+            var_i_arr,
+            vsizes_arr,
+            0.0,
             source_sigma=self.source_voxel_size / 2.0,
             n_counts=n_counts,
             device=self._device,
         )
 
         n = len(leaf_stats)
-        means_arr_4d = np.column_stack([
-            np.array([s.mean for s, _ in leaf_stats]),
-            np.zeros(n),
-        ])
+        means_arr_4d = np.column_stack(
+            [
+                np.array([s.mean for s, _ in leaf_stats]),
+                np.zeros(n),
+            ]
+        )
         means_3d = [s.mean for s, _ in leaf_stats]
-        voxels_4d = [
-            Voxel4D(mean=means_arr_4d[i], precision=precisions[i])
-            for i in range(n)
-        ]
+        voxels_4d = [Voxel4D(mean=means_arr_4d[i], precision=precisions[i]) for i in range(n)]
 
         if not means_3d:
             return
@@ -471,8 +648,8 @@ class IVGICPPipeline:
         self._coarse_iv_gicp._compute_intensity_gradients(means_arr, voxels_4d, tree)
 
         self._coarse_target_voxels_4d = voxels_4d
-        self._coarse_target_means_3d  = means_arr
-        self._coarse_target_tree      = tree
+        self._coarse_target_means_3d = means_arr
+        self._coarse_target_tree = tree
 
     def process_frame(
         self,
@@ -484,9 +661,8 @@ class IVGICPPipeline:
         """
         Process one LiDAR scan. Returns absolute pose and updates internal map.
 
-        Uses direct adaptive voxel → registration path: AdaptiveVoxelMap leaves
-        are converted to Voxel4D and passed directly to IV-GICP, preserving
-        variable-resolution covariances and intensity constraints.
+        Uses flat_map or C++ VoxelMap; leaves are converted to Voxel4D and
+        passed to IV-GICP, preserving variable-resolution covariances and intensity.
 
         Args:
             points:      (N, 3+) array with at least [x, y, z] columns
@@ -497,10 +673,7 @@ class IVGICPPipeline:
         if points.ndim == 1:
             points = points.reshape(1, -1)
         if intensities is None:
-            intensities = (
-                points[:, 3] if points.shape[1] >= 4
-                else np.zeros(len(points))
-            )
+            intensities = points[:, 3] if points.shape[1] >= 4 else np.zeros(len(points))
 
         # Preprocessing: range filter + voxel downsampling
         points, intensities = self._prefilter(points, intensities)
@@ -517,7 +690,7 @@ class IVGICPPipeline:
             else:
                 self.flat_map.insert_frame(points[:, :3], intensities, frame_id=0)
             self._build_voxels_from_adaptive_map()
-            _cpp_cm = getattr(self, '_cpp_coarse_map', None)
+            _cpp_cm = getattr(self, "_cpp_coarse_map", None)
             if _cpp_cm is not None:
                 _cpp_cm.insert_frame(points[:, :3], intensities, 0)
                 self._build_coarse_voxels()
@@ -525,6 +698,11 @@ class IVGICPPipeline:
                 self._coarse_map.insert_frame(points[:, :3], intensities, frame_id=0)
                 self._build_coarse_voxels()
             self.map_voxels = []  # mark as initialized
+            # C2 data-driven scale: alpha = 1/I_scale so residual ~ unit; uniform I → large alpha but omega_I small → cost small.
+            if self._auto_alpha_from_intensity and self.iv_gicp.alpha > 0 and len(intensities) > 10:
+                mad = np.median(np.abs(intensities - np.median(intensities)))
+                i_scale = float(max(mad * 1.4826, 1e-9))
+                self.iv_gicp.alpha = float(np.clip(1.0 / i_scale, 1e-6, 1e4))
             self._frame_count = 1
             self.trajectory.poses = [np.eye(4)]
             self.trajectory.timestamps = [timestamp or 0.0]
@@ -546,9 +724,11 @@ class IVGICPPipeline:
         # Multi-scale: run coarse GICP first to improve initial pose estimate.
         # Coarse map has larger voxels → wider convergence basin → fewer local minima.
         # Result feeds as init_pose into the fine-level registration.
-        if (self._coarse_map is not None
-                and self._coarse_target_tree is not None
-                and self._coarse_target_voxels_4d is not None):
+        if (
+            self._coarse_map is not None
+            and self._coarse_target_tree is not None
+            and self._coarse_target_voxels_4d is not None
+        ):
             T_coarse, _ = self._coarse_iv_gicp.register_with_voxel_map(
                 np.column_stack([points[:, :3], intensities]),
                 intensities,
@@ -560,13 +740,58 @@ class IVGICPPipeline:
             )
             init_pose = T_coarse
 
+        # C2 auto_alpha (Theorem 1): κ high → degenerate → use intensity; κ low → geometry-only
+        # Rebuild target arrays only when alpha changed significantly or every N frames (speed).
+        if self._auto_alpha and self._alpha_max > 0 and self._cpp_voxel_map is not None:
+            kappa = self._cpp_voxel_map.get_max_condition_number()
+            x = (kappa - self._kappa_threshold) / max(self._kappa_scale, 1e-6)
+            sigmoid = 1.0 / (1.0 + np.exp(-float(x)))
+            effective_alpha = self._alpha_max * sigmoid
+            if kappa > self._kappa_threshold:
+                floor = self._alpha_max * self._alpha_floor_ratio
+                effective_alpha = max(effective_alpha, floor)
+            self.iv_gicp.alpha = float(np.clip(effective_alpha, 0.0, self._alpha_max))
+            do_rebuild = False
+            if self._last_auto_alpha is None:
+                do_rebuild = True
+            elif abs(effective_alpha - self._last_auto_alpha) > self._auto_alpha_change_threshold:
+                do_rebuild = True
+            elif (effective_alpha == 0.0) != (self._last_auto_alpha == 0.0):
+                do_rebuild = True
+            elif self._frame_count - self._last_alpha_rebuild_frame >= self._auto_alpha_rebuild_interval:
+                do_rebuild = True
+            if do_rebuild:
+                self._build_voxels_from_adaptive_map()
+                self._last_auto_alpha = effective_alpha
+                self._last_alpha_rebuild_frame = self._frame_count
+
         # Register source → adaptive voxel map (direct path)
         reg_info = {"n_correspondences": 0, "converged": False}
+        # C2 conditional: use intensity only when map has informative gradients.
+        # In uniform-intensity scenes (e.g. metro tunnel), intensity adds noise → use geometry-only.
+        effective_alpha = self.iv_gicp.alpha
+        if self._use_conditional_intensity and self.iv_gicp.alpha > 0 and not self._auto_alpha:
+            mean_grad = 0.0
+            if self._cpp_target_arrays is not None and "grads" in self._cpp_target_arrays:
+                grads = np.asarray(self._cpp_target_arrays["grads"])
+                if len(grads) > 0:
+                    mean_grad = float(np.mean(np.linalg.norm(grads, axis=1)))
+            elif self._target_voxels_4d is not None:
+                grads = np.array([v.intensity_gradient for v in self._target_voxels_4d])
+                if len(grads) > 0:
+                    mean_grad = float(np.mean(np.linalg.norm(grads, axis=1)))
+            if mean_grad < self._intensity_gradient_threshold:
+                effective_alpha = 0.0
+        _alpha_restore = None
+        if effective_alpha != self.iv_gicp.alpha:
+            _alpha_restore = self.iv_gicp.alpha
+            self.iv_gicp.alpha = effective_alpha
         _t_reg = time.perf_counter()
         if self._cpp_target_arrays is not None:
             # C++ fast path: raw arrays bypass Voxel4D extraction overhead
             T, reg_info = self.iv_gicp.register_with_arrays(
-                points[:, :3], intensities,
+                points[:, :3],
+                intensities,
                 self._cpp_target_arrays,
                 init_pose=init_pose,
                 max_corr_dist=adaptive_corr,
@@ -593,13 +818,52 @@ class IVGICPPipeline:
                 target_points = np.column_stack([target_means, target_intensities])
                 source_points = np.column_stack([points[:, :3], intensities])
                 T = self.iv_gicp.register(
-                    source_points, target_points,
+                    source_points,
+                    target_points,
                     source_intensities=intensities,
                     target_intensities=target_intensities,
                     init_pose=init_pose,
                 )
                 reg_info = {"n_correspondences": 999, "converged": True}
+        if _alpha_restore is not None:
+            self.iv_gicp.alpha = _alpha_restore
         reg_ms = (time.perf_counter() - _t_reg) * 1000
+
+        # A.1 Well-posed polish: when geometry is well-conditioned (κ < threshold), refine with geometry-only 1–2 GN steps
+        if (
+            self._well_posed_polish
+            and reg_info.get("converged")
+            and reg_info.get("hessian") is not None
+        ):
+            H = np.asarray(reg_info["hessian"])
+            kappa = np.linalg.cond(H)
+            if kappa < self._well_posed_kappa_threshold:
+                old_alpha = self.iv_gicp.alpha
+                old_max_iter = self.iv_gicp.max_iter
+                self.iv_gicp.alpha = 0.0
+                self.iv_gicp.max_iter = self._well_posed_max_iters
+                try:
+                    if self._cpp_target_arrays is not None:
+                        T, _ = self.iv_gicp.register_with_arrays(
+                            points[:, :3],
+                            intensities,
+                            self._cpp_target_arrays,
+                            init_pose=T,
+                            max_corr_dist=adaptive_corr,
+                        )
+                    elif self._target_voxels_4d is not None and self._target_tree is not None:
+                        T, _ = self.iv_gicp.register_with_voxel_map(
+                            np.column_stack([points[:, :3], intensities]),
+                            intensities,
+                            self._target_voxels_4d,
+                            self._target_means_3d,
+                            self._target_tree,
+                            init_pose=T,
+                            max_corr_dist=adaptive_corr,
+                        )
+                finally:
+                    self.iv_gicp.alpha = old_alpha
+                    self.iv_gicp.max_iter = old_max_iter
 
         # Quality-based sanity check (replaces fixed-threshold check).
         # Reject if: (1) virtually no correspondences found, meaning ICP had no data,
@@ -630,9 +894,7 @@ class IVGICPPipeline:
             pts_world = (T[:3, :3] @ points[:, :3].T).T + T[:3, 3]
             if self._cpp_voxel_map is not None:
                 # C++ path: query cached nanoflann tree, compute median in C++
-                sigma_new = self._cpp_voxel_map.query_sigma(
-                    pts_world, adaptive_corr, self._min_motion_th
-                )
+                sigma_new = self._cpp_voxel_map.query_sigma(pts_world, adaptive_corr, self._min_motion_th)
                 self._adaptive_sigma = sigma_new
             elif self._target_tree is not None:
                 dists, _ = self._target_tree.query(pts_world, k=1)
@@ -643,9 +905,7 @@ class IVGICPPipeline:
 
         self.current_pose = T
         self.trajectory.poses.append(self.current_pose.copy())
-        self.trajectory.timestamps.append(
-            timestamp or self.trajectory.timestamps[-1] + 1.0
-        )
+        self.trajectory.timestamps.append(timestamp or self.trajectory.timestamps[-1] + 1.0)
 
         # Only update the map when registration quality was sufficient.
         # Skipping map update on poor frames prevents corrupted points from
@@ -657,9 +917,11 @@ class IVGICPPipeline:
         self._frame_count += 1
 
         return OdometryResult(
-            pose=T, timestamp=timestamp,
+            pose=T,
+            timestamp=timestamp,
             num_correspondences=n_corr,
-            reg_ms=reg_ms, map_ms=map_ms,
+            reg_ms=reg_ms,
+            map_ms=map_ms,
         )
 
     def _update_map(
@@ -702,12 +964,11 @@ class IVGICPPipeline:
                 if evict_before > 0:
                     self.flat_map.evict_before(evict_before)
 
-        if (self._frame_count % self._kdtree_interval == 0
-                or self._target_tree is None):
+        if self._frame_count % self._kdtree_interval == 0 or self._target_tree is None:
             self._build_voxels_from_adaptive_map()
 
         # Coarse map
-        _cpp_cm = getattr(self, '_cpp_coarse_map', None)
+        _cpp_cm = getattr(self, "_cpp_coarse_map", None)
         if _cpp_cm is not None:
             _cpp_cm.insert_frame(pts_world, intensities, self._frame_count)
             if self._frame_count % 10 == 0:
@@ -718,8 +979,7 @@ class IVGICPPipeline:
                     evict_before_cc = self._frame_count - self._map_frames
                     if evict_before_cc > 0:
                         _cpp_cm.evict_before(evict_before_cc)
-            if (self._frame_count % self._kdtree_interval == 0
-                    or self._coarse_target_tree is None):
+            if self._frame_count % self._kdtree_interval == 0 or self._coarse_target_tree is None:
                 self._build_coarse_voxels()
         elif self._coarse_map is not None:
             self._coarse_map.insert_frame(pts_world, intensities, self._frame_count)
@@ -727,8 +987,7 @@ class IVGICPPipeline:
                 evict_before_c = self._frame_count - self._coarse_map.max_frames
                 if evict_before_c > 0:
                     self._coarse_map.evict_before(evict_before_c)
-            if (self._frame_count % self._kdtree_interval == 0
-                    or self._coarse_target_tree is None):
+            if self._frame_count % self._kdtree_interval == 0 or self._coarse_target_tree is None:
                 self._build_coarse_voxels()
 
     def _window_smooth(
@@ -792,8 +1051,7 @@ class IVGICPPipeline:
         )
 
         # [4] Apply marginalized prior from previous window step (if available).
-        prior_omega = self._marginal_prior_omega if self._marginal_prior_omega is not None \
-                      else np.eye(6) * 1e4
+        prior_omega = self._marginal_prior_omega if self._marginal_prior_omega is not None else np.eye(6) * 1e4
         optimizer.set_prior(buf[0][0], omega=prior_omega)
 
         for T_abs, _, _, _, _ in buf:
@@ -801,7 +1059,7 @@ class IVGICPPipeline:
 
         for i in range(1, K):
             T_rel_i = buf[i][1]
-            H_i     = buf[i][2]
+            H_i = buf[i][2]
             # [2] Scale H by correspondence quality ratio.
             q_i = buf[i][4] / n_max if n_max > 0 else 1.0
             H_sym = (H_i + H_i.T) * 0.5 * q_i
@@ -877,7 +1135,7 @@ class IVGICPPipeline:
 
         voxel_ids = list(range(len(self.map_voxels)))
         means = [v[0] for v in self.map_voxels]
-        covs  = [v[1] for v in self.map_voxels]
+        covs = [v[1] for v in self.map_voxels]
         self.propagator.set_voxel_map(voxel_ids, means, covs)
         self.propagator.propagate(delta_T)
 

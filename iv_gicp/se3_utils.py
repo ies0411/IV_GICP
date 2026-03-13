@@ -1,7 +1,15 @@
-"""SE(3) Lie algebra utilities for factor graph optimization."""
+"""SE(3) Lie algebra utilities for factor graph optimization.
+
+Uses C++ implementation from iv_gicp_core when available (graceful fallback to Python).
+"""
 
 import numpy as np
 from typing import Tuple
+
+try:
+    from .cpp import iv_gicp_core as _se3_cpp
+except ImportError:
+    _se3_cpp = None
 
 
 def skew_symmetric(v: np.ndarray) -> np.ndarray:
@@ -114,3 +122,43 @@ def adjoint_se3(T: np.ndarray) -> np.ndarray:
     Ad[3:, 3:] = R
     Ad[3:, :3] = skew_symmetric(t) @ R
     return Ad
+
+
+# Optional C++ backend (same interface, numpy in/out)
+if _se3_cpp is not None:
+    _f64 = np.float64
+
+    def se3_exp(xi: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+        R, t = _se3_cpp.se3_exp(np.asarray(xi, dtype=_f64, order="C"))
+        return np.asarray(R), np.asarray(t)
+
+    def se3_log(T: np.ndarray) -> np.ndarray:
+        return np.asarray(_se3_cpp.se3_log(np.asarray(T, dtype=_f64, order="C")))
+
+    def se3_inverse(T: np.ndarray) -> np.ndarray:
+        return np.asarray(_se3_cpp.se3_inverse(np.asarray(T, dtype=_f64, order="C")))
+
+    def se3_compose(T1: np.ndarray, T2: np.ndarray) -> np.ndarray:
+        return np.asarray(_se3_cpp.se3_compose(
+            np.asarray(T1, dtype=_f64, order="C"),
+            np.asarray(T2, dtype=_f64, order="C"),
+        ))
+
+    def transform_point(T: np.ndarray, p: np.ndarray) -> np.ndarray:
+        return np.asarray(_se3_cpp.transform_point(
+            np.asarray(T, dtype=_f64, order="C"),
+            np.asarray(p, dtype=_f64, order="C"),
+        ))
+
+    def adjoint_se3(T: np.ndarray) -> np.ndarray:
+        return np.asarray(_se3_cpp.adjoint_se3(np.asarray(T, dtype=_f64, order="C")))
+
+    def se3_to_matrix(R: np.ndarray, t: np.ndarray) -> np.ndarray:
+        return np.asarray(_se3_cpp.se3_to_matrix(
+            np.asarray(R, dtype=_f64, order="C"),
+            np.asarray(t, dtype=_f64, order="C"),
+        ))
+
+    def matrix_to_se3(T: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+        R, t = _se3_cpp.matrix_to_se3(np.asarray(T, dtype=_f64, order="C"))
+        return np.asarray(R), np.asarray(t)

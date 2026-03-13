@@ -122,8 +122,11 @@ def plot_adaptive_voxels(
     """
     import matplotlib.pyplot as plt
 
-    means = np.array([v[0] for v in voxels[:max_display]])
-    covs = [v[1] for v in voxels[:max_display]]
+    voxels = voxels[:max_display]
+    if not voxels:
+        return
+    means = np.array([v[0] for v in voxels])
+    covs = [v[1] for v in voxels]
     sizes = np.array([np.sqrt(np.linalg.det(c + 1e-6 * np.eye(3))) for c in covs])
     fig, ax = plt.subplots(figsize=(8, 8))
     sc = ax.scatter(means[:, 0], means[:, 1], c=sizes, s=5, cmap="plasma", alpha=0.7)

@@ -1,0 +1,66 @@
+# Dataset metadata and per-dataset pipeline overrides.
+# loader: module path or name resolved by run_ablation (e.g. load_kitti).
+# params: override pipeline.yaml; merged when building pipeline.
+
+kitti:
+  loader: load_kitti
+  loader_kw: {}
+  label: "KITTI seq00 (outdoor)"
+  alpha: 0.1
+  params:
+    voxel_size: 1.0
+    source_voxel_size: 0.3
+    max_correspondence_distance: 2.0
+    initial_threshold: 2.0
+    max_map_frames: 10
+    max_iterations: 30
+    min_range: 0.5
+    max_range: 80.0
+
+subt:
+  loader: load_subt
+  loader_kw: {}
+  label: "SubT Final_UGV1 (mine/tunnel)"
+  alpha: 0.25
+  params:
+    voxel_size: 0.5
+    source_voxel_size: 0.3
+    max_correspondence_distance: 2.0
+    initial_threshold: 1.5
+    max_map_frames: 30
+    max_iterations: 30
+    min_range: 0.3
+    max_range: 80.0
+    map_radius: 50.0
+
+metro:
+  loader: load_metro
+  loader_kw: {}
+  label: "GEODE Metro (metro tunnel)"
+  alpha: 0.5
+  params:
+    voxel_size: 0.5
+    source_voxel_size: 0.2
+    max_correspondence_distance: 1.5
+    initial_threshold: 1.5
+    max_map_frames: 20
+    max_iterations: 30
+    min_range: 0.5
+    max_range: 60.0
+    map_radius: 60.0
+
+geode:
+  loader: load_geode_tunnel
+  loader_kw: { seq: "01" }
+  label: "GEODE Urban_Tunnel01 (urban tunnel)"
+  alpha: 0.3
+  params:
+    voxel_size: 0.5
+    source_voxel_size: 0.25
+    max_correspondence_distance: 2.0
+    initial_threshold: 2.0
+    max_map_frames: 40
+    max_iterations: 30
+    min_range: 0.5
+    max_range: 80.0
+    map_radius: 80.0
