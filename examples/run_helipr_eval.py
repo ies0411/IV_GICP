@@ -143,9 +143,9 @@ def run_iv_gicp(frames, scan_ts, alpha, label, device, voxel_size=1.0,
         max_correspondence_distance=2.0,
         initial_threshold=2.0,
         min_motion_th=0.1,
-        max_iterations=12,
+        max_iterations=20,            # 20 itr needed for convergence on dense Ouster scans
         max_map_frames=max_map_frames,
-        map_radius=80.0,              # spatial eviction: keep map near robot
+        map_radius=None,              # age-based eviction
         max_source_points=0,
         auto_alpha=False,
         auto_alpha_from_intensity=False,
@@ -200,9 +200,9 @@ def main():
     ap.add_argument("--seq",        default="DCC05", choices=["DCC05", "KAIST05"])
     ap.add_argument("--max-frames", type=int, default=500)
     ap.add_argument("--device",     default="cpu")
-    ap.add_argument("--alpha",      type=float, default=0.1)
+    ap.add_argument("--alpha",      type=float, default=0.0)   # geometry-only: alpha>0 causes degeneracy
     ap.add_argument("--voxel-size", type=float, default=1.0)
-    ap.add_argument("--max-map-frames", type=int, default=500)
+    ap.add_argument("--max-map-frames", type=int, default=20)  # small window for open-area sections
     ap.add_argument("--skip-kiss",  action="store_true")
     args = ap.parse_args()
 

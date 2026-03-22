@@ -70,6 +70,20 @@ DATASETS = {
         "sensor": "vlp16",
         "env": "mine/tunnel challenge",
     },
+    "Final_UGV2": {
+        "rosbag": "rosbag/SubT_MRS_Final_Challenge_UGV2.zip",
+        "gt":     "LiDAR_Inertial_Track/SubT_MRS_Final_Challenge_UGV2.zip",
+        "gt_file": "SubT_MRS_Final_Challenge_UGV2/ground_truth_path.csv",
+        "sensor": "vlp16",
+        "env": "mine/tunnel challenge",
+    },
+    "Final_UGV3": {
+        "rosbag": "rosbag/SubT_MRS_Final_Challenge_UGV3.zip",
+        "gt":     "LiDAR_Inertial_Track/SubT_MRS_Final_Challenge_UGV3.zip",
+        "gt_file": "SubT_MRS_Final_Challenge_UGV3/ground_truth_path.csv",
+        "sensor": "vlp16",
+        "env": "mine/tunnel challenge",
+    },
     "Laurel": {
         "rosbag": "rosbag/SubT_MRS_Laurel_Caverns_Handheld3.zip",
         "gt":     "LiDAR_Inertial_Track/SubT_MRS_Laurel_Caverns_Handheld3.zip",
@@ -435,10 +449,10 @@ def evaluate_dataset(dataset_name, args):
 
 def main():
     parser = argparse.ArgumentParser(description="SubT-MRS LiDAR Odometry Evaluation")
-    parser.add_argument("--dataset",   default="Urban_UGV1",
+    parser.add_argument("--dataset",   default="Final_UGV1",
                         choices=list(DATASETS.keys()) + ["all"],
                         help="Dataset to evaluate")
-    parser.add_argument("--max-frames", type=int, default=300,
+    parser.add_argument("--max-frames", type=int, default=500,
                         help="Maximum frames to process (default: 300)")
     parser.add_argument("--voxel-size", type=float, default=0.5,
                         help="Target map voxel size (m)")
@@ -448,13 +462,13 @@ def main():
                         help="Max correspondence distance (m)")
     parser.add_argument("--initial-threshold", type=float, default=1.5,
                         help="Initial adaptive threshold sigma")
-    parser.add_argument("--max-iter",  type=int,   default=30,
+    parser.add_argument("--max-iter",  type=int,   default=12,
                         help="Max GN iterations")
     parser.add_argument("--huber-delta", type=float, default=1.0,
                         help="Huber kernel threshold (0=disabled)")
     parser.add_argument("--alpha",     type=float, default=0.1,
                         help="Intensity weight (0=GICP)")
-    parser.add_argument("--max-map-frames", type=int, default=30,
+    parser.add_argument("--max-map-frames", type=int, default=200,
                         help="Sliding window size in frames")
     parser.add_argument("--device",      default="auto",
                         help="Device: auto/cuda/cpu")

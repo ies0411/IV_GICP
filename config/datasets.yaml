@@ -1,66 +1,153 @@
 # Dataset metadata and per-dataset pipeline overrides.
-# loader: module path or name resolved by run_ablation (e.g. load_kitti).
+# loader: module path resolved by run_ablation.py
 # params: override pipeline.yaml; merged when building pipeline.
+#
+# Verified optimal parameters (2026-03-22, 500fr benchmarks):
+#
+# | Dataset          | voxel | source | alpha | mc  | mf  | itr | map_radius | min_th |
+# |------------------|-------|--------|-------|-----|-----|-----|------------|--------|
+# | KITTI outdoor    | 1.0   | 0.3    | 0.1   | 2.0 | 500 |  12 | None       | 0.1    |
+# | SubT underground | 0.5   | 0.3    | 0.1   | 2.0 | 200 |  12 | 200m       | 0.5    |
+# | GEODE urban tun  | 0.5   | 0.25   | 0.0   | 2.0 | 500 |  12 | 80m        | 0.5    |
+# | GEODE metro tun  | 0.5   | 0.2    | 0.5   | 1.5 | 200 |  20 | 60m        | 0.5    |
+# | MulRan (Ouster)  | 1.0   | 0.3    | 0.1   | 2.0 | 500 |  20 | None       | 0.1    |
+# | HeLiPR (Ouster)  | 1.0   | 0.3    | 0.0   | 2.0 |  20 |  20 | None       | 0.1    |
+#
+# Key rules:
+#   alpha=0.0: uniform surfaces (urban tunnel concrete, HeLiPR Ouster reflectivity noise)
+#   alpha=0.5: metallic surfaces with strong intensity signal (metro tunnel)
+#   max_iterations=20: required for Ouster high-density scans (>30k pts/frame)
+#   max_map_frames=20: HeLiPR DCC05 frames 300-500 are open area → large mf causes drift
+#   map_radius=None (outdoor), map_radius=R (tunnel/underground/corridor)
 
 kitti:
   loader: load_kitti
   loader_kw: {}
-  label: 'KITTI seq00 (outdoor)'
+  label: 'KITTI seq00 (outdoor driving, Velodyne HDL-64E)'
   alpha: 0.1
   params:
     voxel_size: 1.0
     source_voxel_size: 0.3
     max_correspondence_distance: 2.0
     initial_threshold: 2.0
-    max_map_frames: 10
-    max_iterations: 30
+    min_motion_th: 0.1
+    max_map_frames: 500
+    max_iterations: 12
     min_range: 0.5
     max_range: 80.0
+    map_radius: null         # age-based eviction (outdoor loop)
+    auto_alpha: false
+    auto_alpha_from_intensity: false
+    source_drop_small_voxels: false
+    source_max_output_features: 0
+    max_source_points: 0
 
 subt:
   loader: load_subt
   loader_kw: {}
-  label: 'SubT Final_UGV1 (mine/tunnel)'
-  alpha: 0.25
+  label: 'SubT Final_UGV1 (mine/tunnel, VLP-16)'
+  alpha: 0.1
   params:
     voxel_size: 0.5
     source_voxel_size: 0.3
     max_correspondence_distance: 2.0
     initial_threshold: 1.5
-    max_map_frames: 30
-    max_iterations: 30
-    min_range: 0.3
-    max_range: 80.0
-    map_radius: 50.0
+    min_motion_th: 0.5        # sigma floor — prevents cascade failure in narrow tunnels
+    max_map_frames: 200
+    max_iterations: 12
+    min_range: 0.5
+    max_range: 50.0
+    map_radius: 200.0         # spatial eviction (underground/mine)
+    auto_alpha: false
+    auto_alpha_from_intensity: false
+    source_drop_small_voxels: false
+    source_max_output_features: 0
+    max_source_points: 0
 
 metro:
   loader: load_metro
   loader_kw: {}
-  label: 'GEODE Metro (metro tunnel)'
-  alpha: 0.5
+  label: 'GEODE Metro Shield_tunnel1 (metro tunnel, Livox Mid-360)'
+  alpha: 0.5                  # metallic walls/windows → intensity helps
   params:
     voxel_size: 0.5
     source_voxel_size: 0.2
     max_correspondence_distance: 1.5
     initial_threshold: 1.5
-    max_map_frames: 20
-    max_iterations: 30
+    min_motion_th: 0.5
+    max_map_frames: 200
+    max_iterations: 12
     min_range: 0.5
     max_range: 60.0
-    map_radius: 60.0
+    map_radius: 60.0          # spatial eviction (tunnel corridor)
+    auto_alpha: false
+    auto_alpha_from_intensity: false
+    source_drop_small_voxels: false
+    source_max_output_features: 0
+    max_source_points: 0
 
 geode:
   loader: load_geode_tunnel
   loader_kw: { seq: '01' }
-  label: 'GEODE Urban_Tunnel01 (urban tunnel)'
-  alpha: 0.3
+  label: 'GEODE Urban_Tunnel01 (concrete tunnel, Velodyne VLP-16)'
+  alpha: 0.0                  # uniform concrete surface → geometry-only
   params:
     voxel_size: 0.5
     source_voxel_size: 0.25
     max_correspondence_distance: 2.0
-    initial_threshold: 2.0
-    max_map_frames: 40
-    max_iterations: 30
+    initial_threshold: 1.5
+    min_motion_th: 0.5        # sigma floor — prevents cascade failure
+    max_map_frames: 500
+    max_iterations: 12
     min_range: 0.5
     max_range: 80.0
-    map_radius: 80.0
+    map_radius: 80.0          # spatial eviction (tunnel)
+    auto_alpha: false
+    auto_alpha_from_intensity: false
+    source_drop_small_voxels: false
+    source_max_output_features: 0
+    max_source_points: 0
+
+mulran:
+  loader: load_mulran
+  loader_kw: {}
+  label: 'MulRan DCC01 (outdoor campus, Ouster OS1-64)'
+  alpha: 0.1
+  params:
+    voxel_size: 1.0
+    source_voxel_size: 0.3
+    max_correspondence_distance: 2.0
+    initial_threshold: 2.0
+    min_motion_th: 0.1
+    max_map_frames: 500
+    max_iterations: 20         # 20 itr needed for convergence (Ouster high-density scans)
+    min_range: 0.5
+    max_range: 80.0
+    map_radius: null           # age-based eviction; IV-GICP 3-4× faster than KISS on MulRan
+    auto_alpha: false
+    auto_alpha_from_intensity: false
+    source_drop_small_voxels: false
+    source_max_output_features: 0
+    max_source_points: 0
+
+helipr:
+  loader: load_helipr
+  loader_kw: {}
+  label: 'HeLiPR DCC05/KAIST05 (outdoor campus, Ouster OS1-64)'
+  alpha: 0.0                  # Ouster reflectivity 0-4000 raw → normalized but alpha>0 causes map degeneracy
+  params:
+    voxel_size: 1.0
+    source_voxel_size: 0.3
+    max_correspondence_distance: 2.0
+    initial_threshold: 2.0
+    min_motion_th: 0.1
+    max_map_frames: 20         # small window: DCC05 open-area sections need tight age window
+    max_iterations: 20         # 20 itr needed for convergence (high-density Ouster scans)
+    min_range: 0.5
+    max_range: 80.0
+    map_radius: null           # age-based eviction
+    auto_alpha: false
+    auto_alpha_from_intensity: false
+    source_drop_small_voxels: false
+    source_max_output_features: 0
+    max_source_points: 0

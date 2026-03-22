@@ -74,7 +74,36 @@ pipeline = IVGICPPipeline(
 | 09  | **0.487m** | 0.507m | -3.9% |
 | 10  | **0.324m** | 0.361m | -10.2% |
 
-**7/11 IV-GICP 승**
+**8/11 IV-GICP 승 또는 동률** (seq01, seq07 제외)
+
+---
+
+### MulRan / HeLiPR (Ouster OS1-64, 야외 캠퍼스)
+
+> **특이사항:** Ouster는 고밀도(~36k pts/frame). IV-GICP가 KISS보다 1.4-3× **더 빠름**.
+> HeLiPR: `alpha=0.0` 필수 (alpha>0이면 map degeneracy 발생). `max_iterations=20` 필수.
+
+```python
+# MulRan
+pipeline = IVGICPPipeline(
+    voxel_size=1.0, source_voxel_size=0.3, alpha=0.1,
+    max_correspondence_distance=2.0, initial_threshold=2.0,
+    min_motion_th=0.1, max_map_frames=500, max_iterations=20,
+    map_radius=None, max_source_points=0,
+    auto_alpha=False, auto_alpha_from_intensity=False,
+    source_drop_small_voxels=False, source_max_output_features=0,
+    device='cpu',
+)
+# HeLiPR: alpha=0.0, max_map_frames=20 (open area 구간 대비)
+```
+
+**MulRan/HeLiPR 500fr 결과:**
+| Dataset | IV-GICP | KISS-ICP | Δ% | 속도 비교 |
+|---------|---------|---------|-----|---------|
+| MulRan DCC01 | 2.771m | **2.706m** | +2.4% | IV 1.4× 빠름 |
+| MulRan KAIST01 | **0.622m** | 0.639m | -2.6% | IV 2.3× 빠름 |
+| HeLiPR DCC05 | 0.697m | **0.573m** | +21.6% | IV 5× 빠름 (fr300-500 open area) |
+| HeLiPR KAIST05 | **0.403m** | 0.626m | -35.6% | IV 1.5× 빠름 |
 
 ---
 
@@ -135,6 +164,9 @@ pipeline = IVGICPPipeline(
 | Urban_UGV1 | **0.276m** | 0.285m | -3.2% |
 | Urban_UGV2 | **0.280m** | 0.288m | -2.8% |
 | Final_UGV1 | **0.084m** | 0.088m | -4.5% |
+| Final_UGV2 | **0.031m** | 0.031m | 0.0% |
+| Final_UGV3 | **0.014m** | 0.016m | -12.5% |
+| Laurel_H3  | 0.042m | **0.036m** | +16.7% |
 
 ---
 
