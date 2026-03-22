@@ -1,10 +1,15 @@
 #!/usr/bin/env python3
 """
-KITTI Odometry Benchmark: IV-GICP vs KISS-ICP vs GenZ-ICP vs GICP-Baseline
+KITTI Odometry Benchmark: IV-GICP vs KISS-ICP (optional GenZ-ICP binary)
 
 Usage:
-    uv run python examples/run_kitti_benchmark.py --seq 08 [--max-frames 300]
-    uv run python examples/run_kitti_benchmark.py --seq 00 --max-frames 500
+    uv run python examples/run_kitti_benchmark.py --seq 00 --max-frames 100
+    uv run python examples/run_kitti_benchmark.py --seq 00 --sparse-speed
+    uv run python examples/run_kitti_benchmark.py --seq 00 --sparse-extreme
+    # --sparse-speed: balanced sparse C4.  --sparse-extreme: LOAM-like minimal features (ATE risk ↑).
+    # Default --max-frames 100: fast IV vs KISS comparison (raise for long-horizon ATE).
+    # Speed budget vs KISS (mean ms/frame): ≤1.5× preferred, >2× should be avoided.
+    # IV-GICP defaults to --device cpu (C++ registration). Use --device cuda only for Python/GPU path (much slower).
 
 Data root assumed: /home/km/data/kitti/dataset
   sequences/XX/velodyne/*.bin   — LiDAR scans
@@ -20,6 +25,7 @@ import subprocess
 import sys
 import time
 from pathlib import Path
+from typing import Optional
 
 import numpy as np
 
@@ -28,6 +34,54 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 KITTI_ROOT   = Path("/home/km/data/kitti/dataset")
 GENZ_BINARY  = Path(__file__).parent.parent / "thirdparty/genz-icp/kitti_runner/build/genz_kitti_runner"
 RESULTS_ROOT = Path(__file__).parent.parent / "results" / "kitti"
+
+# IV-GICP vs KISS mean ms/frame: ≤1.5× acceptable; >2× is considered too slow for iterative tuning.
+SPEED_RATIO_SOFT = 1.5
+SPEED_RATIO_HARD = 2.0
+
+# LOAM-style: cap C4 output + tight GN/map budget (speed first). If ATE blows up, relax
+# source_min_feature_score / plane thresholds or raise source_max_output_features first.
+# Sparse C4 yields few points per 1m map voxel — default min_points_per_voxel=5 can leave
+# zero valid target voxels → reg_ms=0. Use 3 for map eligibility (see docs/speed_first_sparse.md).
+SPARSE_SPEED_PRESET = dict(
+    min_points_per_voxel=3,
+    max_registration_target_voxels=8192,
+    source_voxel_size=0.55,
+    max_map_frames=180,
+    auto_alpha=False,
+    max_iterations=10,
+    max_source_points=1024,
+    source_max_output_features=768,
+    source_min_feature_score=0.01,
+    source_drop_small_voxels=True,
+    use_fim_weight=False,
+    use_entropy_alpha=False,
+    kdtree_interval=8,
+    stable_frames=8,
+    source_plane_planarity_thresh=0.12,
+    source_plane_linearity_thresh=0.12,
+)
+
+# Fewer points / stronger P·L gate than SPARSE_SPEED_PRESET. Tuned so seq00 short runs do not
+# always diverge; for even sparser LOAM-style, lower source_max_output_features in a local fork.
+SPARSE_EXTREME_PRESET = dict(
+    min_points_per_voxel=3,
+    max_registration_target_voxels=6144,
+    source_voxel_size=0.58,
+    max_map_frames=160,
+    auto_alpha=False,
+    max_iterations=9,
+    max_source_points=896,
+    source_max_output_features=640,
+    source_min_feature_score=0.018,
+    source_drop_small_voxels=True,
+    use_fim_weight=False,
+    use_entropy_alpha=False,
+    kdtree_interval=8,
+    stable_frames=8,
+    source_plane_planarity_thresh=0.125,
+    source_plane_linearity_thresh=0.125,
+)
 
 
 # ── Data loading ──────────────────────────────────────────────────────────────
@@ -117,24 +171,32 @@ def print_timing(name, times_ms):
 
 # ── Method runners ────────────────────────────────────────────────────────────
 
-def run_iv_gicp(frames, device, alpha, label, **kw):
+def run_iv_gicp(frames, device, alpha, label, sparse_mode: Optional[str] = None, **kw):
     from iv_gicp.pipeline import IVGICPPipeline
-    pipeline = IVGICPPipeline(
-        voxel_size=1.0,               # standard outdoor voxel size
-        source_voxel_size=0.3,        # KITTI ~120k pts → ~5-15k after 0.3m downsample
-        min_points_per_voxel=5,       # require 5+ pts for reliable covariance (rank 3)
+    params = dict(
+        voxel_size=1.0,
+        source_voxel_size=0.3,
+        min_points_per_voxel=3,
         alpha=alpha,
         max_correspondence_distance=2.0,
         initial_threshold=2.0,
-        min_motion_th=0.05,
-        max_iterations=30,            # 30 GN iterations; typical convergence <20
+        min_motion_th=0.1,
         max_map_points=100_000,
-        max_map_frames=10,            # 10-frame window: ~170m coverage at KITTI speed
-        adaptive_voxelization=False,  # C1 disabled for outdoor (geometry-rich, large map)
+        max_map_frames=500,
+        auto_alpha=False,
+        auto_alpha_from_intensity=False,
+        source_drop_small_voxels=False,
+        source_max_output_features=0,
+        source_min_feature_score=0.0,
+        max_source_points=0,
         device=device,
-        use_distribution_propagation=False,
-        **kw,
     )
+    if sparse_mode == "extreme":
+        params.update(SPARSE_EXTREME_PRESET)
+    elif sparse_mode == "speed":
+        params.update(SPARSE_SPEED_PRESET)
+    params.update(kw)
+    pipeline = IVGICPPipeline(**params)
     abs_poses = []
     times = []
     reg_times = []
@@ -228,11 +290,29 @@ def run_genz_icp(seq: str, max_frames: int, out_dir: Path):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--seq",         default="08",  help="KITTI sequence ID")
-    parser.add_argument("--max-frames",  type=int, default=None)
-    parser.add_argument("--device",      default="auto")
+    parser.add_argument(
+        "--max-frames",
+        type=int,
+        default=100,
+        help="Number of frames (default 100 for quicker IV vs KISS runs).",
+    )
+    parser.add_argument(
+        "--device",
+        default="cpu",
+        help="IV-GICP only: 'cpu' uses C++ core (fast). 'cuda'/'auto' often trigger the slower Python+GPU registration path.",
+    )
     parser.add_argument("--skip-genz",   action="store_true", help="Skip GenZ-ICP (slow build)")
-    parser.add_argument("--window-size", type=int, default=1,
-                        help="FORM window smoothing size (1=disabled, 5-15 for real-time)")
+    sp = parser.add_mutually_exclusive_group()
+    sp.add_argument(
+        "--sparse-speed",
+        action="store_true",
+        help="IV-GICP: sparse C4 (768 cap, mild score gate) + tight GN/map — speed-first, safer ATE.",
+    )
+    sp.add_argument(
+        "--sparse-extreme",
+        action="store_true",
+        help="IV-GICP: LOAM-like minimal C4 (512 cap, stricter P/L) — fastest sparse; ATE may degrade.",
+    )
     args = parser.parse_args()
 
     if args.device == "auto":
@@ -242,7 +322,7 @@ def main():
         except ImportError:
             device = "cpu"
     else:
-        device = args.device
+        device = args.device  # prefer "cpu" for IV-GICP C++ path
 
     out = RESULTS_ROOT / f"seq{args.seq}"
     out.mkdir(parents=True, exist_ok=True)
@@ -250,7 +330,8 @@ def main():
     print(f"\n{'='*70}")
     print(f"  KITTI Odometry Benchmark — seq {args.seq}")
     print(f"  data: {KITTI_ROOT}")
-    print(f"  device: {device}  max_frames: {args.max_frames}  window_size: {args.window_size}")
+    iv_sparse = "extreme" if args.sparse_extreme else ("speed" if args.sparse_speed else None)
+    print(f"  device: {device}  max_frames: {args.max_frames}  iv_sparse_mode: {iv_sparse!r}")
     print(f"{'='*70}")
 
     frames, poses_gt = load_kitti_sequence(args.seq, args.max_frames)
@@ -270,28 +351,28 @@ def main():
         mean_ms=float(np.mean(ki_times)), n_frames=n, device="cpu",
     )
 
-    # ── GICP Baseline (alpha=0) ───────────────────────────────────────────────
-    gi_poses, gi_times, gi_reg, gi_map = run_iv_gicp(frames, device, alpha=0.0, label="GICP-Baseline",
-                                                      window_size=args.window_size)
-    gi_ate, gi_ate_m = ate_rmse(gi_poses, poses_gt) if poses_gt else (float("nan"), float("nan"))
-    gi_kt = kitti_t_err(gi_poses, poses_gt) if poses_gt else float("nan")
-    results["GICP-Baseline"] = dict(
-        ate_rmse=gi_ate, ate_mean=gi_ate_m, kitti_t_err=gi_kt,
-        mean_ms=float(np.mean(gi_times[1:])), n_frames=n, device=device,
-        reg_ms=float(np.mean(gi_reg[1:])), map_ms=float(np.mean(gi_map[1:])),
-    )
-
     # ── IV-GICP (alpha=0.1) ───────────────────────────────────────────────────
     # α=0.5 → omega_I≈225 >> Omega_geo_xx≈1 → intensity dominates geometry → bad.
     # α=0.1 → omega_I≈9 ≈ Omega_geo_xx → balanced geo+intensity contribution.
-    iv_poses, iv_times, iv_reg, iv_map = run_iv_gicp(frames, device, alpha=0.1, label="IV-GICP",
-                                                      window_size=args.window_size)
+    if iv_sparse == "extreme":
+        iv_lab = "IV-GICP (sparse-extreme)"
+        iv_key = "IV-GICP-sparse-extreme"
+    elif iv_sparse == "speed":
+        iv_lab = "IV-GICP (sparse-speed)"
+        iv_key = "IV-GICP-sparse"
+    else:
+        iv_lab = "IV-GICP"
+        iv_key = "IV-GICP"
+    iv_poses, iv_times, iv_reg, iv_map = run_iv_gicp(
+        frames, device, alpha=0.1, label=iv_lab, sparse_mode=iv_sparse,
+    )
     iv_ate, iv_ate_m = ate_rmse(iv_poses, poses_gt) if poses_gt else (float("nan"), float("nan"))
     iv_kt = kitti_t_err(iv_poses, poses_gt) if poses_gt else float("nan")
-    results["IV-GICP"] = dict(
+    results[iv_key] = dict(
         ate_rmse=iv_ate, ate_mean=iv_ate_m, kitti_t_err=iv_kt,
         mean_ms=float(np.mean(iv_times[1:])), n_frames=n, device=device,
         reg_ms=float(np.mean(iv_reg[1:])), map_ms=float(np.mean(iv_map[1:])),
+        sparse_mode=iv_sparse,
     )
 
     # ── GenZ-ICP ─────────────────────────────────────────────────────────────
@@ -321,8 +402,36 @@ def main():
               f"{r.get('device','?'):>7}")
     print(f"{'='*90}")
 
+    # Speed vs KISS (skip frame 0 for both — cold start)
+    kiss_ms = float(np.mean(ki_times[1:])) if n > 1 else float(np.mean(ki_times))
+    iv_ms = float(np.mean(iv_times[1:])) if n > 1 else float(np.mean(iv_times))
+    speed_ratio = iv_ms / kiss_ms if kiss_ms > 1e-9 else float("nan")
+    speed_ok_soft = speed_ratio <= SPEED_RATIO_SOFT
+    speed_ok_hard = speed_ratio <= SPEED_RATIO_HARD
+    print(f"\n  Speed vs KISS (mean ms/fr, frame≥1): IV/KISS = {speed_ratio:.2f}×  "
+          f"(목표 ≤{SPEED_RATIO_SOFT:.1f}×, 상한 {SPEED_RATIO_HARD:.1f}×)")
+    if not speed_ok_hard:
+        print(f"  [경고] IV-GICP가 KISS 대비 {SPEED_RATIO_HARD:.1f}×를 초과했습니다. 속도 개선이 필요합니다.")
+    elif not speed_ok_soft:
+        print(f"  [참고] {SPEED_RATIO_SOFT:.1f}× 초과 — 허용 가능하지만 여유 있으면 최적화 권장.")
+
+    payload = {
+        "seq": args.seq,
+        "n_frames": n,
+        "iv_sparse_mode": iv_sparse,
+        "methods": results,
+        "speed_vs_kiss": {
+            "kiss_mean_ms": kiss_ms,
+            "iv_mean_ms": iv_ms,
+            "ratio_iv_over_kiss": speed_ratio,
+            "target_ratio_max": SPEED_RATIO_SOFT,
+            "hard_cap_ratio": SPEED_RATIO_HARD,
+            "within_soft_budget": speed_ok_soft,
+            "within_hard_cap": speed_ok_hard,
+        },
+    }
     with open(out / "results.json", "w") as f:
-        json.dump({"seq": args.seq, "n_frames": n, "methods": results}, f, indent=2)
+        json.dump(payload, f, indent=2)
     print(f"\n  Saved: {out}/results.json")
 
 

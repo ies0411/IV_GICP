@@ -1,25 +1,20 @@
 # IV-GICP Pipeline default hyperparameters.
 # All pipeline/registration parameters; override per-dataset via datasets.yaml params.
 
-# Adaptive voxelization (C1)
 voxel_size: 1.0
 intensity_range_correction: false
-entropy_threshold: 2.0
-intensity_var_threshold: 100.0
 min_points_per_voxel: 3
-max_depth: 6
-adaptive_voxelization: true
-adaptive_max_depth: 2
-min_eigenvalue_ratio: 0.0
-max_condition_number: 0.0
 
 # IV-GICP registration
 alpha: 0.1
 max_correspondence_distance: 2.0
-max_iterations: 24
+max_iterations: 12
 initial_threshold: 2.0
 min_motion_th: 0.1
 huber_delta: 1.0
+# C++ GN only: uniform subsample of source features (0 = all points, recommended for accuracy).
+# 2048 is a speed preset; use 0 for paper-grade ATE (no accuracy loss on KITTI/SubT/GEODE).
+max_source_points: 0
 
 # Preprocessing
 min_range: 0.5
@@ -28,37 +23,62 @@ source_voxel_size: 0.5
 
 # Map management
 max_map_points: 100000
-max_map_frames: null  # auto from max_map_points if null
+max_map_frames: null # auto from max_map_points if null
 map_radius: null
-kdtree_interval: 4  # rebuild target KDTree every N frames (higher = faster, slightly staler map)
+kdtree_interval: 8 # rebuild target KDTree every N frames (higher = faster, slightly staler map)
+
+# Registration-only: max target voxels for GN+KD (C++ build_target_arrays). 0 = all valid voxels.
+# >0 keeps top-K voxels by per-voxel point count n (map insert/eviction unchanged).
+max_registration_target_voxels: 0
 
 # Multi-scale (outdoor)
 coarse_voxel_size: 0.0
 coarse_iterations: 10
 coarse_max_corr: 0.0
 
-# Window smoothing
-window_size: 1
+# C4 (default on): source = voxel PCA plane/edge + sphericity; map = TSG (stable_frames)
+stable_frames: 10
+source_plane_planarity_thresh: 0.12
+source_plane_linearity_thresh: 0.12
+source_plane_edge_sphere_thresh: 0.5
+source_plane_n_min: 200
+# Sparse confident C4: undersampled voxels dropped; keep top P/L scores (0 = unlimited cap)
+# source_drop_small_voxels=false: dropping sparse voxels is too aggressive and hurts ATE.
+source_drop_small_voxels: false
+source_max_output_features: 0
+source_min_feature_score: 0.0
+source_fim_edge_lambda_min: 0.0
+source_fim_min_corr: 0
 
 # C2 / auto_alpha
 use_conditional_intensity: false
 intensity_gradient_threshold: 1.0e-6
-auto_alpha_from_intensity: true
-auto_alpha: true
+# auto_alpha_from_intensity=false: setting alpha=1/MAD(I) catastrophically inflates alpha
+# (e.g. alpha~6.7 on KITTI [0,1] intensities). Always false for outdoor/tunnel.
+auto_alpha_from_intensity: false
+# auto_alpha=false: kappa-based sigmoid adaptation hurts KITTI seq00 (0.313→0.617m).
+# Use fixed per-domain alpha from datasets.yaml or explicit params.
+auto_alpha: false
 kappa_threshold: 10.0
 kappa_scale: 7.0
 alpha_floor_ratio: 0.2
 
-# C1/C3 (ablation)
+# C1/C3: single default for all scenes; prefer speeding up C1 in C++ over turning it off long-term.
 use_fim_weight: false
-use_entropy_alpha: false
+use_entropy_alpha: true
 entropy_scale_c: 0.5
 
-# Distribution propagation
-use_distribution_propagation: true
+# Device (cpu default: C++ 등록 경로가 가장 빠름)
+device: 'cpu'
 
-# Device
-device: "auto"
+# OpenMP thread count (0 = system default / OMP_NUM_THREADS env var)
+omp_num_threads: 0
+
+# C4 MSCS: Minimum Sufficient Correspondence Set
+# Stop accumulating correspondences once λ_min(H) ≥ λ_max(H)/mscs_kappa_max.
+# Theorem 1 well-posedness → stopping criterion. No dataset-specific tuning.
+use_mscs: false
+mscs_kappa_max: 100.0
 
 # Theory reinforcements
 well_posed_polish: false

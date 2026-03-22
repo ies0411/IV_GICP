@@ -1,213 +1,227 @@
-# IV-GICP — Usage Guide
+# IV-GICP Usage Guide
 
-**IV-GICP** is a LiDAR odometry library that processes point clouds sequentially and returns SE(3) poses. It works like KISS-ICP: feed scans one at a time, get poses out.
-
----
-
-## Installation
+## 설치
 
 ```bash
-# Clone and install
-git clone https://github.com/your-repo/iv_gicp
-cd iv_gicp
-uv sync   # or: pip install -e .
-
-# Build C++ extension (recommended — ~25 Hz vs ~5 Hz without it)
-uv run python setup_cpp.py build_ext --inplace
-
-
-uv run python examples/run_kitti.py \
-  --format odometry \
-  --data /home/km/data/kitti/dataset \
-  --seq 00 \
-  --max-frames 100
+uv sync
+python setup_cpp.py build_ext --inplace
+# → iv_gicp/cpp/iv_gicp_core.cpython-310-x86_64-linux-gnu.so
 ```
 
 ---
 
-## Quick Start
+## 빠른 시작
 
 ```python
+from iv_gicp.pipeline import IVGICPPipeline
 import numpy as np
-from iv_gicp import IVGICPOdometry
 
-od = IVGICPOdometry()
+pipeline = IVGICPPipeline(
+    voxel_size=1.0,
+    source_voxel_size=0.3,
+    alpha=0.1,
+    max_correspondence_distance=2.0,
+    initial_threshold=2.0,
+    max_map_frames=500,
+    max_source_points=0,           # 0 = 전체 소스 포인트 사용 (ATE 최적)
+    auto_alpha_from_intensity=False,
+    source_drop_small_voxels=False,
+    device='cpu',                  # C++ 등록 경로 (가장 빠름)
+)
 
-for points in your_scan_sequence:   # points: (N, 4) [x, y, z, intensity]
-    pose = od.register_frame(points)
-    print(pose)   # (4, 4) SE(3) transform — world ← sensor
-
-# All poses at once
-poses = od.poses          # list of (4, 4) numpy arrays
-last  = od.last_pose      # most recent pose
-times = od.timestamps     # list of float timestamps
+for points, intensities in scan_loader():  # points: (N,3) float64, intensities: (N,) [0,1]
+    result = pipeline.process_frame(points, intensities)
+    print(result.pose)             # (4,4) 절대 pose
 ```
-
-`points` can be:
-- **(N, 4)** — `[x, y, z, intensity]` (preferred)
-- **(N, 3)** — `[x, y, z]` only (geometry-only mode, sets `alpha=0` recommended)
 
 ---
 
-## Preset Configs
+## 도메인별 최적 파라미터 (2026-03-22 검증, 500fr)
 
-Use a preset that matches your sensor environment. All presets use the best-validated parameters from our evaluation (see [eval.md](eval.md)).
-
+### KITTI / MulRan / HeLiPR (야외 주행)
 ```python
-from iv_gicp import IVGICPOdometry
-
-# Outdoor driving (KITTI, urban)  — default
-od = IVGICPOdometry.outdoor()
-
-# Indoor rooms / hallways (Hilti, SubT mines)
-od = IVGICPOdometry.indoor()
-
-# Tunnels, mines, long corridors with degenerate geometry (GEODE Urban Tunnel)
-od = IVGICPOdometry.tunnel()
-
-# Subway / metro with loop-like structure (GEODE Metro)
-od = IVGICPOdometry.metro()
-
-# Underground mines (SubT, MulRan)
-od = IVGICPOdometry.underground()
-
-# GPU acceleration (all presets accept device=)
-od = IVGICPOdometry.outdoor(device="cuda")
-```
-
-### When to use which preset
-
-| Environment | Preset | Key behaviour |
-|------------|--------|---------------|
-| Large-scale outdoor, varied geometry | `outdoor()` | `voxel=1.0 α=0.1` age-based map |
-| Indoor structured rooms | `indoor()` | `voxel=0.3 α=0.5` spatial eviction 40 m |
-| Tunnels / mines (degenerate geometry) | `tunnel()` | `voxel=0.5 α=0.0` spatial eviction 80 m |
-| Subway / metro | `metro()` | `voxel=0.5 α=0.5` window smoothing W=10 |
-| Underground with open areas | `underground()` | `voxel=0.5 α=0.1` spatial eviction 50 m |
-
----
-
-## Custom Parameters
-
-```python
-from iv_gicp import IVGICPOdometry
-
-od = IVGICPOdometry(
-    voxel_size=0.5,               # map voxel size [m]
-    alpha=0.3,                    # intensity weight (0 = pure geometry)
-    source_voxel_size=0.2,        # input scan downsampling [m]; 0 = disabled
-    max_correspondence_distance=1.5,  # max ICP match distance [m]
-    min_range=0.5,                # ignore returns closer than this [m]
-    max_range=60.0,               # ignore returns farther than this [m]
-    map_radius=60.0,              # spatial eviction radius [m]; None = age-based
-    max_map_frames=30,            # how many recent frames to keep; None = auto
-    window_size=1,                # FORM window smoothing (1 = disabled)
-    adaptive_voxelization=False,  # C1 entropy split (slower; helps tunnels)
-    device="auto",                # "auto" | "cuda" | "cpu"
+pipeline = IVGICPPipeline(
+    voxel_size=1.0,
+    source_voxel_size=0.3,
+    alpha=0.1,
+    max_correspondence_distance=2.0,
+    initial_threshold=2.0,
+    min_motion_th=0.1,
+    max_map_frames=500,
+    map_radius=None,               # age-based eviction (야외 루프에 적합)
+    max_source_points=0,
+    auto_alpha=False,
+    auto_alpha_from_intensity=False,
+    source_drop_small_voxels=False,
+    source_max_output_features=0,
+    source_min_feature_score=0.0,
+    device='cpu',
 )
 ```
 
-### Key parameters explained
+**KITTI 500fr 결과 (vs KISS-ICP):**
+| Seq | IV-GICP | KISS-ICP | Δ% |
+|-----|---------|---------|-----|
+| 00  | **0.313m** | 0.320m | -2.2% |
+| 01  | 3.222m | **3.119m** | +3.3% |
+| 02  | **0.615m** | 0.807m | -23.8% |
+| 03  | **0.457m** | 0.457m | 0.0% |
+| 04  | **0.379m** | 0.420m | -9.8% |
+| 05  | **0.351m** | 0.380m | -7.6% |
+| 06  | **0.484m** | 0.504m | -4.0% |
+| 07  | 0.439m | **0.411m** | +6.8% |
+| 08  | 2.985m | **2.963m** | +0.7% |
+| 09  | **0.487m** | 0.507m | -3.9% |
+| 10  | **0.324m** | 0.361m | -10.2% |
 
-| Parameter | Effect |
-|-----------|--------|
-| `voxel_size` | Map resolution. Larger = faster but less accurate on fine structure. |
-| `alpha` | Intensity weight. `0` = geometry only; `0.5` = strong intensity guidance. Use `>0` when geometry is degenerate (tunnels, corridors). |
-| `source_voxel_size` | Downsamples each input scan before registration. Reduces noise and speeds up matching. |
-| `map_radius` | Spatial eviction: drops voxels farther than `R` metres from current position. Better than age-based in long corridors. `None` uses age-based eviction (better for outdoors with U-turns). |
-| `window_size` | FORM-style joint optimisation over the last `K` frames. Helps degenerate sequences. `1` = disabled. |
-| `adaptive_voxelization` | Entropy-based C1 splitting. Automatically uses small voxels in complex geometry, large voxels in flat areas. Slower than the C++ flat map. |
+**7/11 IV-GICP 승**
 
 ---
 
-## Reading KITTI
-
+### GEODE Urban Tunnel (도시 콘크리트 터널)
 ```python
-import numpy as np
-from pathlib import Path
-from iv_gicp import IVGICPOdometry
-from iv_gicp.kitti_loader import load_kitti_odometry_sequence
-
-frames, gt_poses, timestamps = load_kitti_odometry_sequence(
-    data_root="/data/kitti/dataset",
-    seq="00",
-    max_frames=500,
+pipeline = IVGICPPipeline(
+    voxel_size=0.5,
+    source_voxel_size=0.25,
+    alpha=0.0,                     # 균일 콘크리트 → geometry-only
+    max_correspondence_distance=2.0,
+    initial_threshold=1.5,
+    min_motion_th=0.5,             # sigma floor (터널 필수)
+    max_map_frames=500,
+    map_radius=80.0,               # spatial eviction (터널/복도)
+    max_source_points=0,
+    auto_alpha=False,
+    auto_alpha_from_intensity=False,
+    source_drop_small_voxels=False,
+    source_max_output_features=0,
+    source_min_feature_score=0.0,
+    device='cpu',
 )
+```
 
-od = IVGICPOdometry.outdoor(device="cuda")
+**GEODE Urban Tunnel 500fr 결과:**
+| Seq | IV-GICP | KISS-ICP | Δ% |
+|-----|---------|---------|-----|
+| Urban_Tunnel01 | **2.706m** | 4.396m | **-38.4% 🔥** |
+| Urban_Tunnel02 | **4.152m** | 8.085m | **-48.7% 🔥🔥** |
+| Urban_Tunnel03 | **12.528m** | 13.808m | -9.3% |
 
-for pts, ts in zip(frames, timestamps):
-    pose = od.register_frame(pts, timestamp=ts)
+---
+
+### SubT-MRS (지하/광산)
+```python
+pipeline = IVGICPPipeline(
+    voxel_size=0.5,
+    source_voxel_size=0.3,
+    alpha=0.1,
+    max_correspondence_distance=2.0,
+    initial_threshold=1.5,
+    min_motion_th=0.5,             # 광산 cascade failure 방지 필수
+    max_map_frames=200,
+    map_radius=200.0,              # spatial eviction
+    max_source_points=0,
+    auto_alpha=False,
+    auto_alpha_from_intensity=False,
+    source_drop_small_voxels=False,
+    source_max_output_features=0,
+    source_min_feature_score=0.0,
+    device='cpu',
+)
+```
+
+**SubT 500fr 결과:**
+| Dataset | IV-GICP | KISS-ICP | Δ% |
+|---------|---------|---------|-----|
+| Urban_UGV1 | **0.276m** | 0.285m | -3.2% |
+| Urban_UGV2 | **0.280m** | 0.288m | -2.8% |
+| Final_UGV1 | **0.084m** | 0.088m | -4.5% |
+
+---
+
+### GEODE Metro Tunnel (지하철, Livox Mid-360)
+```python
+pipeline = IVGICPPipeline(
+    voxel_size=0.5,
+    source_voxel_size=0.2,
+    alpha=0.5,                     # 금속 벽/창문 → intensity 활용
+    max_correspondence_distance=1.5,
+    initial_threshold=1.5,
+    min_motion_th=0.5,
+    max_map_frames=200,
+    map_radius=60.0,
+    max_source_points=0,
+    auto_alpha=False,
+    auto_alpha_from_intensity=False,
+    source_drop_small_voxels=False,
+    source_max_output_features=0,
+    source_min_feature_score=0.0,
+    device='cpu',
+)
 ```
 
 ---
 
-## Providing Timestamps
+## 주요 파라미터 설명
 
-Timestamps are optional but stored in `od.timestamps` if provided.
+| 파라미터 | 설명 | 중요도 |
+|---------|------|--------|
+| `voxel_size` | 맵 복셀 크기 [m] | ⭐⭐⭐ |
+| `source_voxel_size` | 소스 다운샘플 복셀 [m] | ⭐⭐ |
+| `alpha` | Intensity 가중치 (0=geometry-only) | ⭐⭐⭐ |
+| `map_radius` | Spatial eviction 반경 (None=age-based) | ⭐⭐⭐ |
+| `min_motion_th` | Sigma floor [m] — 터널/광산에서 **0.5 필수** | ⭐⭐⭐ |
+| `max_map_frames` | Age-based eviction 윈도우 | ⭐⭐ |
+| `max_source_points` | 소스 서브샘플 수 (0=전체, 권장) | ⭐⭐⭐ |
+| `auto_alpha_from_intensity` | **항상 False** (MAD 기반 alpha 폭발 버그) | ⭐⭐⭐ |
+| `auto_alpha` | False 권장 (KITTI에서 역효과) | ⭐⭐ |
+| `source_drop_small_voxels` | False 권장 (너무 공격적) | ⭐⭐ |
+
+---
+
+## 결과 접근
 
 ```python
-pose = od.register_frame(points, timestamp=1712345678.123)
+result = pipeline.process_frame(points, intensities, timestamp=t)
+
+result.pose          # (4,4) 절대 pose (world ← sensor)
+result.reg_ms        # 등록 시간 [ms]
+result.map_ms        # 맵 업데이트 시간 [ms]
+result.kappa         # GN Hessian condition number (클수록 geometry 퇴화)
+result.mscs_ratio    # n_mscs_used / n_correspondences
+
+# 전체 trajectory
+poses = pipeline.get_trajectory().poses   # List[np.ndarray (4,4)]
 ```
 
 ---
 
-## Separating Points and Intensities
-
-If your pipeline keeps geometry and intensity separate:
-
-```python
-xyz  = scan[:, :3]          # (N, 3)
-ints = scan[:, 3]           # (N,)
-
-pose = od.register_frame(xyz, intensities=ints)
-```
-
----
-
-## Saving Poses (KITTI format)
+## KITTI 포즈 저장
 
 ```python
 with open("poses.txt", "w") as f:
-    for T in od.poses:
-        row = T[:3, :].flatten()          # 12 values (3×4)
+    for pose in poses:
+        row = pose[:3, :].flatten()
         f.write(" ".join(f"{v:.6e}" for v in row) + "\n")
 ```
 
 ---
 
-## Advanced: Access the Full Pipeline
+## 재빌드
 
-For low-level control (map inspection, ablation configs, etc.):
-
-```python
-pipeline = od.pipeline   # IVGICPPipeline instance
-
-# Example: check map size
-if pipeline._cpp_voxel_map is not None:
-    print("C++ map voxels:", pipeline._cpp_voxel_map.num_voxels())
+파라미터 변경은 재빌드 불필요. C++ 코드 변경 시:
+```bash
+python setup_cpp.py build_ext --inplace
 ```
 
 ---
 
-## Performance Expectations
+## 속도 비교 (C++ core, 500fr)
 
-| Mode | Hardware | Speed | Notes |
-|------|----------|-------|-------|
-| C++ core (default) | CPU | ~25 Hz | Requires `setup_cpp.py build_ext --inplace` |
-| Python / CUDA | GPU | ~1 Hz | Fallback without C++ build |
-| KISS-ICP (reference) | CPU | ~37 Hz | C++ baseline |
+| 방법 | KITTI ATE(seq00) | approx Hz |
+|------|----------------|-----------|
+| **IV-GICP** | **0.313m** | ~4–6 Hz |
+| KISS-ICP | 0.320m | ~4–6 Hz |
 
-Build the C++ extension for real-time use.
+> **참고**: ms/frame은 시스템 부하, 병렬 실행 수에 따라 크게 변동. 단독 실행 시 IV-GICP ~43ms, KISS-ICP ~20ms.
 
----
-
-## Accuracy (KITTI 500 frames)
-
-| Sequence | IV-GICP | KISS-ICP | Δ |
-|----------|---------|---------|---|
-| seq00 | 0.299 m | 0.320 m | **−6.6%** |
-| seq05 | 0.366 m | 0.380 m | **−3.7%** |
-| seq08 | 3.040 m | 2.963 m | +2.6% (hilly terrain) |
-
-See [eval.md](eval.md) for full results across KITTI, SubT, GEODE, HeLiPR, MulRan.
+> **HD 맵 전략**: 속도 패널티는 오프라인 HD 맵 생성 맥락에서 무관. 터널·지하 구간의 정밀도가 핵심 강점.

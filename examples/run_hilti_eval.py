@@ -122,7 +122,6 @@ def run_iv_gicp(frames, device="cuda"):
         min_motion_th=0.03,
         max_iterations=20,
         device=device,
-        use_distribution_propagation=False,
     )
 
     abs_poses = [np.eye(4)]
@@ -179,42 +178,6 @@ def run_kiss_icp(frames):
     return abs_poses, {"total": times}
 
 
-# ── GICP Baseline runner (GPU, alpha=0) ───────────────────────────────────────
-
-def run_gicp_baseline(frames, device="cuda"):
-    """GICP baseline via pipeline with alpha=0 (geometry only, no intensity)."""
-    import sys; sys.path.insert(0, str(Path(__file__).parent.parent))
-    from iv_gicp.pipeline import IVGICPPipeline
-
-    pipeline = IVGICPPipeline(
-        voxel_size=1.0,
-        source_voxel_size=0.5,
-        alpha=0.0,
-        max_iterations=20,
-        device=device,
-        use_distribution_propagation=False,
-    )
-
-    abs_poses = [np.eye(4)]
-    times = []
-    print(f"\n[GICP-Baseline Pipeline] {len(frames)} frames  device={device}")
-    for i, (ts, pts) in enumerate(frames):
-        pts_no_i = pts.copy(); pts_no_i[:, 3] = 0.0
-        t0 = time.perf_counter()
-        result = pipeline.process_frame(pts_no_i[:, :3], pts_no_i[:, 3], timestamp=ts)
-        elapsed = (time.perf_counter() - t0) * 1000
-        abs_poses.append(result.pose.copy())
-        times.append(elapsed)
-        if i % 100 == 0 or i == len(frames) - 1:
-            print(f"  {i:4d}/{len(frames)}  {elapsed:6.0f}ms", end="\r")
-
-    _print_timing("GICP-Baseline", times[1:])
-    rel_poses = []
-    for i in range(1, len(abs_poses)):
-        rel_poses.append(np.linalg.inv(abs_poses[i-1]) @ abs_poses[i])
-    return rel_poses, {"total": times[1:]}
-
-
 def _print_timing(name, times):
     times = np.array(times)
     print(f"\n  [{name}] mean={times.mean():.1f}ms  "
@@ -233,8 +196,6 @@ def main():
     parser.add_argument("--device", default="auto")
     parser.add_argument("--kiss-only", action="store_true",
                         help="Run KISS-ICP only (fast, full sequence)")
-    parser.add_argument("--no-gicp-baseline", action="store_true",
-                        help="Skip slow GICP baseline")
     args = parser.parse_args()
 
     if args.device == "auto":
@@ -285,23 +246,6 @@ def main():
             "n_frames": n,
             "device": device,
         }
-
-        # ── GICP Baseline ─────────────────────────────────────────────────────
-        if not args.no_gicp_baseline:
-            gb_rel, gb_timing = run_gicp_baseline(frames, device=device)
-            gb_poses = compose_poses(gb_rel)
-            save_tum(gb_poses, timestamps, out / "gicp_baseline.tum")
-            path_len, end_disp = traj_stats(gb_poses)
-            results["GICP-Baseline"] = {
-                "mean_ms":  float(np.mean(gb_timing["total"])),
-                "median_ms": float(np.median(gb_timing["total"])),
-                "std_ms":   float(np.std(gb_timing["total"])),
-                "hz":       float(1000 / np.mean(gb_timing["total"])),
-                "path_length_m": path_len,
-                "end_displacement_m": end_disp,
-                "n_frames": n,
-                "device": device,
-            }
 
     # ── Summary ───────────────────────────────────────────────────────────────
     print(f"\n{'='*72}")

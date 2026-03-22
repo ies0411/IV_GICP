@@ -13,7 +13,7 @@ Ablation configs:
   E:  C2+C3       — alpha=X, use_fim_weight=False, use_entropy_alpha=True
   F:  Full(C1+2+3)— alpha=X, use_fim_weight=True,  use_entropy_alpha=True
 
-Baseline A (GICP-Base): 동일한 adaptive voxel map 사용, 단 C1(FIM 가중치)·C2(intensity)·C3(entropy scale) 미사용.
+Baseline A (GICP-Base): 동일한 C++ VoxelMap 사용, 단 C1(FIM 가중치)·C2(intensity)·C3(entropy scale) 미사용.
 따라서 A vs B~F는 같은 맵 위에서 우리가 추가한 요소만 켜는 공정한 ablation이다.
 
 Supported datasets:
@@ -89,10 +89,11 @@ def rpe_rmse(poses_est, poses_gt, delta=1):
 # ── KITTI data loading ─────────────────────────────────────────────────────────
 
 
-def load_kitti(max_frames=300):
-    seq = "00"
+def load_kitti(max_frames=300, seq="00"):
     velo_dir = KITTI_ROOT / "sequences" / seq / "velodyne"
     pose_file = KITTI_ROOT / "poses" / f"{seq}.txt"
+    if not velo_dir.exists() or not pose_file.exists():
+        return [], []
 
     bins = sorted(velo_dir.glob("*.bin"))[:max_frames]
     frames = []
@@ -161,21 +162,36 @@ def _decode_vlp16(packets_data_list):
     return np.vstack(all_pts).astype(np.float64) if all_pts else np.zeros((0, 4))
 
 
-def load_subt(max_frames=300):
+def load_subt(max_frames=300, bag_key="SubT_MRS_Final_Challenge_UGV1"):
+    """bag_key: e.g. SubT_MRS_Final_Challenge_UGV1 (zip basename without .zip).
+    Prefers extracted folders over zip files for both GT and rosbag.
+    """
     from rosbags.rosbag1 import Reader
     from rosbags.typesys import get_types_from_msg, get_typestore, Stores
+    import tempfile, os as _os
 
-    ds_info = {
-        "rosbag": "rosbag/SubT_MRS_Final_Challenge_UGV1.zip",
-        "gt": "LiDAR_Inertial_Track/SubT_MRS_Final_Challenge_UGV1.zip",
-        "gt_file": "SubT_MRS_Final_Challenge_UGV1/ground_truth_path.csv",
+    inner_folder = bag_key.replace(".zip", "")
+
+    # Mapping from bag_key → extracted rosbag folder name (strip SubT_MRS_ prefix + add _Rosbag)
+    _rosbag_folder_map = {
+        "SubT_MRS_Final_Challenge_UGV1":    "Final_Challenge_UGV1_Rosbag",
+        "SubT_MRS_Final_Challenge_UGV2":    "Final_Challenge_UGV2_Rosbag",
+        "SubT_MRS_Final_Challenge_UGV3":    "Final_Challenge_UGV3_Rosbag",
+        "SubT_MRS_Laurel_Caverns_Handheld3":"Laurel_Cavern_Rosbag",
+        "SubT_MRS_Urban_Challenge_UGV1":    "Urban_Challenge_UGV1_Rosbag",
+        "SubT_MRS_Urban_Challenge_UGV2":    "Urban_Challenge_UGV2_Rosbag",
     }
 
-    # Load GT
-    gt_zip = SUBT_ROOT / ds_info["gt"]
-    with zipfile.ZipFile(gt_zip) as z:
-        with z.open(ds_info["gt_file"]) as f:
-            lines = f.read().decode().strip().split("\n")
+    # ── Load GT (extracted folder preferred, zip fallback) ─────────────────────
+    gt_csv = SUBT_ROOT / "LiDAR_Inertial_Track" / inner_folder / "ground_truth_path.csv"
+    gt_zip = SUBT_ROOT / f"LiDAR_Inertial_Track/{inner_folder}.zip"
+    if gt_csv.exists():
+        lines = gt_csv.read_text().strip().split("\n")
+    else:
+        with zipfile.ZipFile(gt_zip) as z:
+            with z.open(f"{inner_folder}/ground_truth_path.csv") as f:
+                lines = f.read().decode().strip().split("\n")
+
     gt_ts, gt_poses = [], []
     for line in lines[1:]:
         parts = line.strip().split(",")
@@ -201,10 +217,7 @@ def load_subt(max_frames=300):
     T0_inv = np.linalg.inv(gt_poses[0])
     gt_poses = [T0_inv @ p for p in gt_poses]
 
-    # Load LiDAR frames
-    bag_zip = SUBT_ROOT / ds_info["rosbag"]
-    import tempfile, os as _os
-
+    # ── Load LiDAR frames (extracted folder preferred, zip fallback) ───────────
     typestore = get_typestore(Stores.ROS1_NOETIC)
     add_types = {}
     for t, msgdef in [
@@ -214,38 +227,60 @@ def load_subt(max_frames=300):
         add_types.update(get_types_from_msg(msgdef, t))
     typestore.register(add_types)
 
+    def _read_bag_file(bag_path):
+        """Read frames from a single .bag file path."""
+        result = []
+        with Reader(bag_path) as bag:
+            pkt_conns = [
+                c for c in bag.connections
+                if "velodyne" in c.topic.lower() and c.msgtype == "velodyne_msgs/msg/VelodyneScan"
+            ]
+            for conn, ts, raw in bag.messages(connections=pkt_conns):
+                msg = typestore.deserialize_ros1(raw, "velodyne_msgs/msg/VelodyneScan")
+                pkts = [bytes(p.data) for p in msg.packets]
+                pts = _decode_vlp16(pkts)
+                r = np.linalg.norm(pts[:, :3], axis=1)
+                pts = pts[(r > 0.5) & (r < 80.0)]
+                if len(pts) > 100:
+                    ts_ns = msg.header.stamp.sec * 10**9 + msg.header.stamp.nanosec
+                    result.append((ts_ns, pts))
+        return result
+
     frames = []
-    with zipfile.ZipFile(bag_zip) as z:
-        bag_files = sorted([n for n in z.namelist() if n.endswith(".bag")])
-        for bag_name in bag_files:
-            bag_data = z.read(bag_name)
-            with tempfile.NamedTemporaryFile(suffix=".bag", delete=False) as tf:
-                tf.write(bag_data)
-                tmp_path = tf.name
-            try:
-                with Reader(tmp_path) as bag:
-                    pkt_conns = [
-                        c
-                        for c in bag.connections
-                        if "velodyne" in c.topic.lower() and c.msgtype == "velodyne_msgs/msg/VelodyneScan"
-                    ]
-                    for conn, ts, raw in bag.messages(connections=pkt_conns):
-                        msg = typestore.deserialize_ros1(raw, "velodyne_msgs/msg/VelodyneScan")
-                        pkts = [bytes(p.data) for p in msg.packets]
-                        pts = _decode_vlp16(pkts)
-                        r = np.linalg.norm(pts[:, :3], axis=1)
-                        pts = pts[(r > 0.5) & (r < 80.0)]
-                        if len(pts) > 100:
-                            ts_ns = msg.header.stamp.sec * 10**9 + msg.header.stamp.nanosec
-                            frames.append((ts_ns, pts))
+    rosbag_folder = SUBT_ROOT / "rosbag" / _rosbag_folder_map.get(inner_folder, "")
+    bag_zip = SUBT_ROOT / f"rosbag/{inner_folder}.zip"
+
+    if rosbag_folder.exists():
+        # Direct folder: read .bag files without temp copy
+        for bag_path in sorted(rosbag_folder.glob("*.bag")):
+            for item in _read_bag_file(str(bag_path)):
+                frames.append(item)
+                if len(frames) % 50 == 0:
+                    print(f"  Loaded {len(frames)}/{max_frames} ...", end="\r")
+                if len(frames) >= max_frames:
+                    break
+            if len(frames) >= max_frames:
+                break
+    else:
+        # Zip fallback: extract each .bag to a temp file
+        with zipfile.ZipFile(bag_zip) as z:
+            bag_files = sorted([n for n in z.namelist() if n.endswith(".bag")])
+            for bag_name in bag_files:
+                bag_data = z.read(bag_name)
+                with tempfile.NamedTemporaryFile(suffix=".bag", delete=False) as tf:
+                    tf.write(bag_data)
+                    tmp_path = tf.name
+                try:
+                    for item in _read_bag_file(tmp_path):
+                        frames.append(item)
                         if len(frames) % 50 == 0:
                             print(f"  Loaded {len(frames)}/{max_frames} ...", end="\r")
                         if len(frames) >= max_frames:
                             break
-            finally:
-                _os.unlink(tmp_path)
-            if len(frames) >= max_frames:
-                break
+                finally:
+                    _os.unlink(tmp_path)
+                if len(frames) >= max_frames:
+                    break
 
     print(f"\n  Done: {len(frames)} frames")
 
@@ -347,12 +382,16 @@ def _parse_livox(raw: bytes, max_range=60.0):
     return secs * 1e9 + nsecs, pts[valid]
 
 
-def load_metro(max_frames=300):
+def load_metro(max_frames=300, tunnel_id=1):
+    """tunnel_id: 1=Shield_tunnel1_gamma, 2=Shield_tunnel2_gamma, 3=Shield_tunnel3_gamma."""
     from rosbags.rosbag1 import Reader
     from scipy.spatial.transform import Rotation
 
-    bag_path = GEODE_ROOT / "sensor_data/Metro_tunnel/Shield_tunnel1_gamma/Shield_tunnel1_gamma.bag"
-    gt_path = GEODE_ROOT / "groundtruth/metro_tunnel/Shield_tunnel1.txt"
+    name = f"Shield_tunnel{tunnel_id}_gamma"
+    bag_path = GEODE_ROOT / f"sensor_data/Metro_tunnel/{name}/{name}.bag"
+    gt_path = GEODE_ROOT / f"groundtruth/metro_tunnel/Shield_tunnel{tunnel_id}.txt"
+    if not bag_path.exists() or not gt_path.exists():
+        return [], []
 
     # GT
     data = np.loadtxt(gt_path)
@@ -410,15 +449,12 @@ def run_config(
     alpha,
     use_fim_weight,
     use_entropy_alpha,
-    window,
     params,
     device,
     auto_alpha=False,
 ):
     pipeline_kw = dict(
         alpha=alpha,
-        adaptive_voxelization=True,  # same map structure for all
-        window_size=window,
         device=device,
         use_fim_weight=use_fim_weight,
         use_entropy_alpha=use_entropy_alpha,
@@ -494,13 +530,13 @@ def _build_datasets():
 DATASETS = _build_datasets()
 
 ABLATION_CONFIGS = [
-    # (label,            use_fim_weight, use_entropy_alpha, alpha_ratio, window)
-    ("A: GICP-Base", False, False, 0.0, 1),
-    ("B: +C1", True, False, 0.0, 1),
-    ("C: +C2", False, False, 1.0, 1),
-    ("D: C1+C2", True, False, 1.0, 1),
-    ("E: C2+C3", False, True, 1.0, 1),
-    ("F: Full(C1+2+3)", True, True, 1.0, 1),
+    # (label,            use_fim_weight, use_entropy_alpha, alpha_ratio)
+    ("A: GICP-Base", False, False, 0.0),
+    ("B: +C1", True, False, 0.0),
+    ("C: +C2", False, False, 1.0),
+    ("D: C1+C2", True, False, 1.0),
+    ("E: C2+C3", False, True, 1.0),
+    ("F: Full(C1+2+3)", True, True, 1.0),
 ]
 
 
@@ -521,11 +557,10 @@ def run_dataset(ds_key, max_frames, device, auto_alpha=True):
         use_fim_weight = row[1]
         use_entropy_alpha = row[2]
         alpha_ratio = row[3]
-        window = row[4]
         alpha = ds["alpha"] * alpha_ratio
         use_auto = auto_alpha and (alpha_ratio > 0)
         auto_str = " auto_α" if use_auto else ""
-        print(f"\n[{cfg_label}]  C1={use_fim_weight}  C2(α)={alpha_ratio:.1f}  C3={use_entropy_alpha}  window={window}{auto_str}")
+        print(f"\n[{cfg_label}]  C1={use_fim_weight}  C2(α)={alpha_ratio:.1f}  C3={use_entropy_alpha}{auto_str}")
         out = run_config(
             cfg_label,
             frames,
@@ -533,7 +568,6 @@ def run_dataset(ds_key, max_frames, device, auto_alpha=True):
             alpha=alpha,
             use_fim_weight=use_fim_weight,
             use_entropy_alpha=use_entropy_alpha,
-            window=window,
             params=ds["params"],
             device=device,
             auto_alpha=use_auto,

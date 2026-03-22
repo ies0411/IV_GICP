@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-HeLiPR Odometry Benchmark: IV-GICP vs KISS-ICP vs GICP-Baseline
+HeLiPR Odometry Benchmark: IV-GICP vs KISS-ICP
 
 Sequences available:
   /home/km/data/HeLiPR/DCC05/   — urban campus (Ouster OS1-64)
@@ -15,7 +15,6 @@ GT format (LiDAR_GT/Ouster_gt.txt):
 Usage:
     uv run python examples/run_helipr_eval.py --seq DCC05 --max-frames 300
     uv run python examples/run_helipr_eval.py --seq KAIST05 --max-frames 300 --alpha 0.1
-    uv run python examples/run_helipr_eval.py --seq DCC05 --max-frames 500 --window-size 5
 """
 
 import argparse
@@ -135,7 +134,7 @@ def compute_ate(est_poses, est_timestamps_ns, gt_timestamps_ns, gt_poses):
 # ── Method runners ─────────────────────────────────────────────────────────────
 
 def run_iv_gicp(frames, scan_ts, alpha, label, device, voxel_size=1.0,
-                max_map_frames=10, window_size=1, **kw):
+                max_map_frames=500, **kw):
     from iv_gicp.pipeline import IVGICPPipeline
     pipeline = IVGICPPipeline(
         voxel_size=voxel_size,
@@ -143,18 +142,21 @@ def run_iv_gicp(frames, scan_ts, alpha, label, device, voxel_size=1.0,
         alpha=alpha,
         max_correspondence_distance=2.0,
         initial_threshold=2.0,
-        min_motion_th=0.05,
-        max_iterations=30,
+        min_motion_th=0.1,
+        max_iterations=12,
         max_map_frames=max_map_frames,
         map_radius=80.0,              # spatial eviction: keep map near robot
-        adaptive_voxelization=False,
+        max_source_points=0,
+        auto_alpha=False,
+        auto_alpha_from_intensity=False,
+        source_drop_small_voxels=False,
+        source_max_output_features=0,
+        source_min_feature_score=0.0,
         device=device,
-        window_size=window_size,
-        use_distribution_propagation=False,
         **kw,
     )
     poses, times = [], []
-    print(f"\n[{label}] {len(frames)} frames  α={alpha}  voxel={voxel_size}  W={window_size}")
+    print(f"\n[{label}] {len(frames)} frames  α={alpha}  voxel={voxel_size}")
     for i, f in enumerate(frames):
         t0 = time.perf_counter()
         result = pipeline.process_frame(f[:, :3], f[:, 3], timestamp=float(scan_ts[i]))
@@ -196,12 +198,11 @@ def run_kiss_icp(frames, scan_ts, voxel_size=1.0):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--seq",        default="DCC05", choices=["DCC05", "KAIST05"])
-    ap.add_argument("--max-frames", type=int, default=300)
-    ap.add_argument("--device",     default="cuda")
+    ap.add_argument("--max-frames", type=int, default=500)
+    ap.add_argument("--device",     default="cpu")
     ap.add_argument("--alpha",      type=float, default=0.1)
     ap.add_argument("--voxel-size", type=float, default=1.0)
-    ap.add_argument("--max-map-frames", type=int, default=10)
-    ap.add_argument("--window-size", type=int, default=1)
+    ap.add_argument("--max-map-frames", type=int, default=500)
     ap.add_argument("--skip-kiss",  action="store_true")
     args = ap.parse_args()
 
@@ -211,18 +212,10 @@ def main():
     out_dir = RESULTS_ROOT / args.seq
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    # GICP-Baseline
-    poses, _ = run_iv_gicp(frames, scan_ts, alpha=0.0, label="GICP-Baseline",
-                            device=args.device, voxel_size=args.voxel_size,
-                            max_map_frames=args.max_map_frames, window_size=args.window_size)
-    ate = compute_ate(poses, scan_ts, gt_ts, gt_poses)
-    results["gicp_baseline"] = ate
-    print(f"  ATE RMSE: {ate:.4f}m")
-
     # IV-GICP
     poses, _ = run_iv_gicp(frames, scan_ts, alpha=args.alpha, label=f"IV-GICP (α={args.alpha})",
                             device=args.device, voxel_size=args.voxel_size,
-                            max_map_frames=args.max_map_frames, window_size=args.window_size)
+                            max_map_frames=args.max_map_frames)
     ate = compute_ate(poses, scan_ts, gt_ts, gt_poses)
     results[f"iv_gicp_a{args.alpha}"] = ate
     print(f"  ATE RMSE: {ate:.4f}m")
@@ -236,7 +229,7 @@ def main():
 
     # Summary
     print(f"\n{'='*55}")
-    print(f"HeLiPR/{args.seq}  {args.max_frames}fr  voxel={args.voxel_size}  W={args.window_size}")
+    print(f"HeLiPR/{args.seq}  {args.max_frames}fr  voxel={args.voxel_size}")
     print(f"{'Method':<25} {'ATE(m)':>8}")
     print(f"{'-'*35}")
     for k, v in results.items():

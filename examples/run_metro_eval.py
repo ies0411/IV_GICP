@@ -1,7 +1,7 @@
 """
 GEODE Metro Tunnel Evaluation Script
 =====================================
-Evaluates IV-GICP vs GICP-Baseline vs KISS-ICP on GEODE Metro Tunnel dataset.
+Evaluates IV-GICP vs KISS-ICP on GEODE Metro Tunnel dataset.
 Sensor: Livox Mid-360 (non-repetitive scan, 24000 pts/frame at 10Hz)
 Topic: /livox/lidar  (livox_ros_driver/msg/CustomMsg, 19 bytes/point)
 
@@ -151,7 +151,7 @@ def compose_poses(rel_list):
 
 # ── Method runners (same as run_geode_eval.py) ────────────────────────────────
 
-def run_iv_gicp(frames, device="cuda", window_size=1):
+def run_iv_gicp(frames, device="cuda"):
     import sys; sys.path.insert(0, str(Path(__file__).parent.parent))
     from iv_gicp.pipeline import IVGICPPipeline
 
@@ -161,14 +161,20 @@ def run_iv_gicp(frames, device="cuda", window_size=1):
         alpha=0.5,
         max_correspondence_distance=1.5,
         initial_threshold=1.5,
+        min_motion_th=0.5,
+        max_map_frames=200,
         max_iterations=20,
         map_radius=60.0,              # spatial eviction for metro tunnel
-        window_size=window_size,
+        auto_alpha=False,
+        auto_alpha_from_intensity=False,
+        source_drop_small_voxels=False,
+        source_max_output_features=0,
+        source_min_feature_score=0.0,
+        max_source_points=0,
         device=device,
-        use_distribution_propagation=False,
     )
     abs_poses, times = [np.eye(4)], []
-    print(f"\n[IV-GICP] {len(frames)} frames  device={device}  α=0.5  window={window_size}")
+    print(f"\n[IV-GICP] {len(frames)} frames  device={device}  α=0.5")
     for i, (ts, pts) in enumerate(frames):
         t0 = time.perf_counter()
         result = pipeline.process_frame(pts[:, :3], pts[:, 3], timestamp=ts)
@@ -177,36 +183,6 @@ def run_iv_gicp(frames, device="cuda", window_size=1):
         if i % 100 == 0 or i == len(frames) - 1:
             print(f"  {i:4d}/{len(frames)}  {elapsed:6.0f}ms", end="\r")
     _print_timing("IV-GICP", times[1:])
-    rel = [np.linalg.inv(abs_poses[i-1]) @ abs_poses[i] for i in range(1, len(abs_poses))]
-    return rel, {"total": times[1:]}
-
-
-def run_gicp_baseline(frames, device="cuda"):
-    import sys; sys.path.insert(0, str(Path(__file__).parent.parent))
-    from iv_gicp.pipeline import IVGICPPipeline
-
-    pipeline = IVGICPPipeline(
-        voxel_size=0.5,
-        source_voxel_size=0.2,
-        alpha=0.0,
-        max_correspondence_distance=1.5,
-        initial_threshold=1.5,
-        max_iterations=20,
-        map_radius=60.0,              # spatial eviction for metro tunnel
-        device=device,
-        use_distribution_propagation=False,
-    )
-    abs_poses, times = [np.eye(4)], []
-    print(f"\n[GICP-Baseline] {len(frames)} frames  device={device}  α=0.0")
-    for i, (ts, pts) in enumerate(frames):
-        pts_g = pts.copy(); pts_g[:, 3] = 0.0
-        t0 = time.perf_counter()
-        result = pipeline.process_frame(pts_g[:, :3], pts_g[:, 3], timestamp=ts)
-        elapsed = (time.perf_counter() - t0) * 1000
-        abs_poses.append(result.pose.copy()); times.append(elapsed)
-        if i % 100 == 0 or i == len(frames) - 1:
-            print(f"  {i:4d}/{len(frames)}  {elapsed:6.0f}ms", end="\r")
-    _print_timing("GICP-Baseline", times[1:])
     rel = [np.linalg.inv(abs_poses[i-1]) @ abs_poses[i] for i in range(1, len(abs_poses))]
     return rel, {"total": times[1:]}
 
@@ -265,8 +241,6 @@ def main():
     parser.add_argument("--max-frames", type=int, default=None)
     parser.add_argument("--device",    default="auto")
     parser.add_argument("--kiss-only", action="store_true")
-    parser.add_argument("--no-gicp-baseline", action="store_true")
-    parser.add_argument("--window-size", type=int, default=1)
     args = parser.parse_args()
 
     if args.device == "auto":
@@ -313,7 +287,7 @@ def main():
 
     if not args.kiss_only:
         # ── IV-GICP ───────────────────────────────────────────────────────────
-        iv_rel, iv_t = run_iv_gicp(frames, device=device, window_size=args.window_size)
+        iv_rel, iv_t = run_iv_gicp(frames, device=device)
         iv_poses = compose_poses(iv_rel)
         save_tum(iv_poses, timestamps, out / "iv_gicp.tum")
         pl, ed = traj_stats(iv_poses)
@@ -322,17 +296,6 @@ def main():
                               "hz": float(1000/np.mean(iv_t["total"])),
                               "path_length_m": pl, "end_displacement_m": ed,
                               "ate_rmse_m": ate, "n_frames": n, "device": device}
-
-        if not args.no_gicp_baseline:
-            gb_rel, gb_t = run_gicp_baseline(frames, device=device)
-            gb_poses = compose_poses(gb_rel)
-            save_tum(gb_poses, timestamps, out / "gicp_baseline.tum")
-            pl, ed = traj_stats(gb_poses)
-            ate = compute_ate(out / "gt.tum", out / "gicp_baseline.tum")
-            results["GICP-Baseline"] = {"mean_ms": float(np.mean(gb_t["total"])),
-                                        "hz": float(1000/np.mean(gb_t["total"])),
-                                        "path_length_m": pl, "end_displacement_m": ed,
-                                        "ate_rmse_m": ate, "n_frames": n, "device": device}
 
     # ── Summary ───────────────────────────────────────────────────────────────
     print(f"\n{'='*76}")

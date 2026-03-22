@@ -22,10 +22,10 @@ _compile_args = [
     "-std=c++17",
     "-O3",
     "-march=native",
-    "-ffast-math",
     "-DNDEBUG",
     "-Wall",
     "-Wextra",
+    # Omit -ffast-math: can cause heap corruption / segfault in GN loop with large point clouds
 ]
 
 _include_dirs = [

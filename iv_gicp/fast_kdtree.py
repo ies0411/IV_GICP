@@ -13,13 +13,7 @@ Usage:
 import numpy as np
 from typing import Tuple
 
-# Try loading the C++ extension (built with: python setup_cpp.py build_ext --inplace)
-_CPP_AVAILABLE = False
-try:
-    from iv_gicp.cpp import iv_gicp_cpp as _cpp
-    _CPP_AVAILABLE = True
-except ImportError:
-    pass
+from iv_gicp.cpp import iv_gicp_cpp as _cpp
 
 
 class FastKDTree:
@@ -42,13 +36,8 @@ class FastKDTree:
         """
         pts = np.ascontiguousarray(points[:, :3], dtype=np.float64)
 
-        if _CPP_AVAILABLE:
-            self._tree = _cpp.KDTree3D(pts)
-            self._backend = 'cpp'
-        else:
-            from scipy.spatial import cKDTree
-            self._tree = cKDTree(pts)
-            self._backend = 'scipy'
+        self._tree = _cpp.KDTree3D(pts)
+        self._backend = "cpp"
 
     def query(
         self,
@@ -70,28 +59,20 @@ class FastKDTree:
         """
         q = np.ascontiguousarray(points[:, :3], dtype=np.float64)
 
-        if self._backend == 'cpp':
-            dists, indices = self._tree.query(q, k, distance_upper_bound)
-            n = self._tree.size()
-            # Match scipy: not-found entries → (inf, n_points)
-            not_found = indices == n
-            dists = dists.astype(np.float64)
-            dists[not_found] = np.inf
-            if k == 1:
-                dists   = dists.ravel()
-                indices = indices.ravel()
-            return dists, indices
-        else:
-            return self._tree.query(q, k=k, distance_upper_bound=distance_upper_bound)
+        dists, indices = self._tree.query(q, k, distance_upper_bound)
+        n = self._tree.size()
+        not_found = indices == n
+        dists = dists.astype(np.float64)
+        dists[not_found] = np.inf
+        if k == 1:
+            dists = dists.ravel()
+            indices = indices.ravel()
+        return dists, indices
 
     @property
     def backend(self) -> str:
-        """Returns 'cpp' or 'scipy'."""
         return self._backend
 
     @property
     def n(self) -> int:
-        """Number of points in the tree."""
-        if self._backend == 'cpp':
-            return self._tree.size()
-        return self._tree.n
+        return self._tree.size()

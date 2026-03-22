@@ -14,13 +14,12 @@ dependencies = [
     "kiss-icp>=1.2.3",
     "pybind11>=2.10.0",
     "ipdb>=0.13.0",
-    "rosbags>=0.1.0"
+    "rosbags>=0.1.0",
+    "torch>=2.0.0",
+    "evo>=1.31.1",
 ]
 
 [project.optional-dependencies]
-gpu = [
-    "torch>=2.0.0",
-]
 dev = [
     "pytest>=7.0",
 ]

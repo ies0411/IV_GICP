@@ -1,7 +1,7 @@
 """
 GEODE Urban Tunnel Evaluation Script
 =====================================
-Evaluates IV-GICP vs GICP-Baseline vs KISS-ICP on GEODE dataset
+Evaluates IV-GICP vs KISS-ICP on GEODE dataset
 Urban Tunnel sequences (Urban_Tunnel01/02/03).
 
 These sequences expose severe geometric degeneracy:
@@ -13,12 +13,9 @@ Usage:
     uv run python examples/run_geode_eval.py --seq 02                 # Tunnel02
     uv run python examples/run_geode_eval.py --max-frames 300         # fast subset test
     uv run python examples/run_geode_eval.py --kiss-only              # KISS-ICP only
-    uv run python examples/run_geode_eval.py --no-gicp-baseline       # skip baseline
-
 Output:
     results/geode/Urban_TunnelXX/iv_gicp.tum
     results/geode/Urban_TunnelXX/kiss_icp.tum
-    results/geode/Urban_TunnelXX/gicp_baseline.tum
     results/geode/Urban_TunnelXX/gt.tum          (GT in local frame for evo_ape)
     results/geode/Urban_TunnelXX/results.json
 
@@ -164,24 +161,28 @@ def compose_poses(T_list):
 
 # ── Method runners ────────────────────────────────────────────────────────────
 
-def run_iv_gicp(frames, device="cuda", window_size=1):
+def run_iv_gicp(frames, device="cuda"):
     import sys; sys.path.insert(0, str(Path(__file__).parent.parent))
     from iv_gicp.pipeline import IVGICPPipeline
 
     pipeline = IVGICPPipeline(
-        voxel_size=1.0,
-        source_voxel_size=0.5,
-        alpha=0.5,                   # intensity: key for tunnel degeneracy recovery
-        max_correspondence_distance=3.0,
-        initial_threshold=3.0,
-        min_motion_th=0.1,
+        voxel_size=0.5,
+        source_voxel_size=0.25,
+        alpha=0.0,                   # uniform concrete tunnel: geometry-only
+        max_correspondence_distance=2.0,
+        initial_threshold=1.5,
+        min_motion_th=0.5,           # sigma floor for tunnel environment
         huber_delta=1.0,
         max_iterations=30,
-        adaptive_voxelization=True,  # C1: entropy-based for tunnels
-        max_map_frames=20,
-        window_size=window_size,
+        max_map_frames=500,
+        map_radius=80.0,             # spatial eviction for tunnel
+        auto_alpha=False,
+        auto_alpha_from_intensity=False,
+        source_drop_small_voxels=False,
+        source_max_output_features=0,
+        source_min_feature_score=0.0,
+        max_source_points=0,
         device=device,
-        use_distribution_propagation=False,
     )
 
     abs_poses = [np.eye(4)]
@@ -209,49 +210,6 @@ def run_iv_gicp(frames, device="cuda", window_size=1):
     return rel_poses, {"total": times[1:], "reg": reg_times[1:], "map": map_times[1:]}
 
 
-def run_gicp_baseline(frames, device="cuda", window_size=1):
-    import sys; sys.path.insert(0, str(Path(__file__).parent.parent))
-    from iv_gicp.pipeline import IVGICPPipeline
-
-    pipeline = IVGICPPipeline(
-        voxel_size=0.5,
-        source_voxel_size=0.25,
-        alpha=0.0,
-        max_correspondence_distance=2.0,
-        initial_threshold=2.0,
-        huber_delta=1.0,
-        max_iterations=30,
-        adaptive_voxelization=False,
-        max_map_frames=40,
-        map_radius=80.0,              # spatial eviction: keep map near robot
-        window_size=window_size,
-        device=device,
-        use_distribution_propagation=False,
-    )
-
-    abs_poses = [np.eye(4)]
-    times = []
-    reg_times = []
-    map_times = []
-    print(f"\n[GICP-Baseline] {len(frames)} frames  device={device}")
-    for i, (ts, pts) in enumerate(frames):
-        pts_no_i = pts.copy(); pts_no_i[:, 3] = 0.0
-        t0 = time.perf_counter()
-        result = pipeline.process_frame(pts_no_i[:, :3], pts_no_i[:, 3], timestamp=ts)
-        elapsed = (time.perf_counter() - t0) * 1000
-        abs_poses.append(result.pose.copy())
-        times.append(elapsed)
-        reg_times.append(result.reg_ms)
-        map_times.append(result.map_ms)
-        if i % 100 == 0 or i == len(frames) - 1:
-            print(f"  {i:4d}/{len(frames)}  {elapsed:6.0f}ms", end="\r")
-
-    _print_timing("GICP-Baseline", times[1:])
-    rel_poses = [np.linalg.inv(abs_poses[i-1]) @ abs_poses[i]
-                 for i in range(1, len(abs_poses))]
-    return rel_poses, {"total": times[1:], "reg": reg_times[1:], "map": map_times[1:]}
-
-
 def run_kiss_icp(frames):
     from kiss_icp.kiss_icp import KissICP
     from kiss_icp.config import KISSConfig
@@ -260,7 +218,7 @@ def run_kiss_icp(frames):
     config.data.deskew = False
     config.data.max_range = 80.0
     config.data.min_range = 0.5
-    config.mapping.voxel_size = 1.5   # fast vehicle: KISS-ICP auto-tunes but start coarse
+    config.mapping.voxel_size = 0.5   # Urban tunnel: fine voxels for tight corridors
 
     od = KissICP(config=config)
     abs_poses = [np.eye(4)]
@@ -313,9 +271,6 @@ def main():
     parser.add_argument("--max-frames", type=int, default=None)
     parser.add_argument("--device", default="auto")
     parser.add_argument("--kiss-only", action="store_true")
-    parser.add_argument("--no-gicp-baseline", action="store_true")
-    parser.add_argument("--window-size", type=int, default=1,
-                        help="FORM window smoothing (1=disabled, e.g. 10)")
     args = parser.parse_args()
 
     if args.device == "auto":
@@ -363,7 +318,7 @@ def main():
 
     if not args.kiss_only:
         # ── IV-GICP ───────────────────────────────────────────────────────────
-        iv_rel, iv_timing = run_iv_gicp(frames, device=device, window_size=args.window_size)
+        iv_rel, iv_timing = run_iv_gicp(frames, device=device)
         iv_poses = compose_poses(iv_rel)
         save_tum(iv_poses, timestamps, out / "iv_gicp.tum")
         path_len, end_disp = traj_stats(iv_poses)
@@ -376,22 +331,6 @@ def main():
             "path_length_m": path_len, "end_displacement_m": end_disp,
             "ate_rmse_m": ate, "n_frames": n, "device": device,
         }
-
-        # ── GICP Baseline ─────────────────────────────────────────────────────
-        if not args.no_gicp_baseline:
-            gb_rel, gb_timing = run_gicp_baseline(frames, device=device, window_size=args.window_size)
-            gb_poses = compose_poses(gb_rel)
-            save_tum(gb_poses, timestamps, out / "gicp_baseline.tum")
-            path_len, end_disp = traj_stats(gb_poses)
-            ate = compute_ate(out / "gt.tum", out / "gicp_baseline.tum")
-            results["GICP-Baseline"] = {
-                "mean_ms": float(np.mean(gb_timing["total"])),
-                "hz": float(1000 / np.mean(gb_timing["total"])),
-                "reg_ms": float(np.mean(gb_timing["reg"])),
-                "map_ms": float(np.mean(gb_timing["map"])),
-                "path_length_m": path_len, "end_displacement_m": end_disp,
-                "ate_rmse_m": ate, "n_frames": n, "device": device,
-            }
 
     # ── Summary ───────────────────────────────────────────────────────────────
     print(f"\n{'='*76}")

@@ -5,7 +5,7 @@
 kitti:
   loader: load_kitti
   loader_kw: {}
-  label: "KITTI seq00 (outdoor)"
+  label: 'KITTI seq00 (outdoor)'
   alpha: 0.1
   params:
     voxel_size: 1.0
@@ -20,7 +20,7 @@ kitti:
 subt:
   loader: load_subt
   loader_kw: {}
-  label: "SubT Final_UGV1 (mine/tunnel)"
+  label: 'SubT Final_UGV1 (mine/tunnel)'
   alpha: 0.25
   params:
     voxel_size: 0.5
@@ -36,7 +36,7 @@ subt:
 metro:
   loader: load_metro
   loader_kw: {}
-  label: "GEODE Metro (metro tunnel)"
+  label: 'GEODE Metro (metro tunnel)'
   alpha: 0.5
   params:
     voxel_size: 0.5
@@ -51,8 +51,8 @@ metro:
 
 geode:
   loader: load_geode_tunnel
-  loader_kw: { seq: "01" }
-  label: "GEODE Urban_Tunnel01 (urban tunnel)"
+  loader_kw: { seq: '01' }
+  label: 'GEODE Urban_Tunnel01 (urban tunnel)'
   alpha: 0.3
   params:
     voxel_size: 0.5

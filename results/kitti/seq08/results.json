@@ -1,42 +1,35 @@
 {
   "seq": "08",
-  "n_frames": 500,
+  "n_frames": 100,
+  "iv_sparse_mode": null,
   "methods": {
     "KISS-ICP": {
-      "ate_rmse": 2.9630089730429354,
-      "ate_mean": 2.02789861941725,
-      "kitti_t_err": 134.99634471844266,
-      "mean_ms": 80.11190849449486,
-      "n_frames": 500,
+      "ate_rmse": 1.1515467115667155,
+      "ate_mean": 1.0158492279284326,
+      "kitti_t_err": NaN,
+      "mean_ms": 827.012416687794,
+      "n_frames": 100,
       "device": "cpu"
-    },
-    "GICP-Baseline": {
-      "ate_rmse": 3.0406180258910886,
-      "ate_mean": 2.11044964526089,
-      "kitti_t_err": 134.86562041853446,
-      "mean_ms": 850.0962581416454,
-      "n_frames": 500,
-      "device": "cuda",
-      "reg_ms": 762.4216514493979,
-      "map_ms": 46.49034874300978
     },
     "IV-GICP": {
-      "ate_rmse": 3.0403133237170112,
-      "ate_mean": 2.109928434662247,
-      "kitti_t_err": 134.86615220329156,
-      "mean_ms": 874.8857724818146,
-      "n_frames": 500,
-      "device": "cuda",
-      "reg_ms": 750.6345664076358,
-      "map_ms": 83.18994080420129
-    },
-    "GenZ-ICP": {
-      "ate_rmse": 2.979228610302294,
-      "ate_mean": 2.0679939237066347,
-      "kitti_t_err": 134.9446985549344,
-      "mean_ms": NaN,
-      "n_frames": 500,
-      "device": "cpu"
+      "ate_rmse": 1.149301963726746,
+      "ate_mean": 1.0136547715324733,
+      "kitti_t_err": NaN,
+      "mean_ms": 1193.993369065639,
+      "n_frames": 100,
+      "device": "cpu",
+      "reg_ms": 795.8133369119781,
+      "map_ms": 250.72485745197744,
+      "sparse_mode": null
     }
+  },
+  "speed_vs_kiss": {
+    "kiss_mean_ms": 830.7353254511124,
+    "iv_mean_ms": 1193.993369065639,
+    "ratio_iv_over_kiss": 1.4372728984616938,
+    "target_ratio_max": 1.5,
+    "hard_cap_ratio": 2.0,
+    "within_soft_budget": true,
+    "within_hard_cap": true
   }
 }

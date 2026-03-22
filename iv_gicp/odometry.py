@@ -36,9 +36,7 @@ class IVGICPOdometry:
         source_voxel_size: Input scan downsampling voxel size (m).  0 = no downsampling.
         map_radius: Spatial eviction radius (m).  None = age-based eviction.
         max_map_frames: How many recent frames to keep in the map.  None = auto.
-        window_size: FORM-style window smoothing frames.  1 = disabled.
-        adaptive_voxelization: C1 entropy-based voxel splitting (slower; helps tunnels).
-        device: ``"auto"`` | ``"cuda"`` | ``"cpu"``.
+        device: ``"cpu"`` (default) | ``"cuda"`` | ``"auto"``.
     """
 
     def __init__(
@@ -51,9 +49,8 @@ class IVGICPOdometry:
         max_range: float = 80.0,
         map_radius: Optional[float] = None,
         max_map_frames: Optional[int] = None,
-        window_size: int = 1,
-        adaptive_voxelization: bool = False,
-        device: str = "auto",
+        device: str = "cpu",
+        **pipeline_kwargs: object,
     ) -> None:
         self._pipeline = IVGICPPipeline(
             voxel_size=voxel_size,
@@ -64,15 +61,14 @@ class IVGICPOdometry:
             max_range=max_range,
             map_radius=map_radius,
             max_map_frames=max_map_frames,
-            window_size=window_size,
-            adaptive_voxelization=adaptive_voxelization,
             device=device,
+            **pipeline_kwargs,
         )
 
     # ── Preset constructors ────────────────────────────────────────────────
 
     @classmethod
-    def outdoor(cls, device: str = "auto") -> "IVGICPOdometry":
+    def outdoor(cls, device: str = "cpu") -> "IVGICPOdometry":
         """Large-scale outdoor (KITTI, urban driving).
 
         Best for sequences with varied geometry and good intensity contrast.
@@ -88,7 +84,7 @@ class IVGICPOdometry:
         )
 
     @classmethod
-    def indoor(cls, device: str = "auto") -> "IVGICPOdometry":
+    def indoor(cls, device: str = "cpu") -> "IVGICPOdometry":
         """Indoor rooms and corridors (Hilti, SubT mines).
 
         Smaller voxels + higher intensity weight for structured indoor scenes.
@@ -104,7 +100,7 @@ class IVGICPOdometry:
         )
 
     @classmethod
-    def tunnel(cls, device: str = "auto") -> "IVGICPOdometry":
+    def tunnel(cls, device: str = "cpu") -> "IVGICPOdometry":
         """Degenerate geometry: tunnels, mines, corridors (GEODE Urban Tunnel, SubT).
 
         Pure geometry registration; spatial map eviction prevents old-map contamination.
@@ -120,11 +116,8 @@ class IVGICPOdometry:
         )
 
     @classmethod
-    def metro(cls, device: str = "auto") -> "IVGICPOdometry":
-        """Long-corridor subway / metro (GEODE Metro).
-
-        Intensity-augmented with window smoothing to handle geometry degeneracy.
-        """
+    def metro(cls, device: str = "cpu") -> "IVGICPOdometry":
+        """Long-corridor subway / metro (GEODE Metro)."""
         return cls(
             voxel_size=0.5,
             alpha=0.5,
@@ -132,12 +125,11 @@ class IVGICPOdometry:
             max_correspondence_distance=1.5,
             max_range=60.0,
             map_radius=60.0,
-            window_size=10,
             device=device,
         )
 
     @classmethod
-    def underground(cls, device: str = "auto") -> "IVGICPOdometry":
+    def underground(cls, device: str = "cpu") -> "IVGICPOdometry":
         """Underground mines and constrained environments (SubT, MulRan).
 
         Spatial eviction + moderate intensity weight.

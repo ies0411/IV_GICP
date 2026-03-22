@@ -1,7 +1,7 @@
 """
 SubT-MRS LiDAR Odometry Evaluation
 
-Evaluates IV-GICP, GICP-Baseline, and KISS-ICP on SubT-MRS datasets.
+Evaluates IV-GICP and KISS-ICP on SubT-MRS datasets.
 Supports:
   - Urban Challenge UGV1/UGV2 (VLP-16, underground urban corridors)
   - Final Challenge UGV1/UGV2 (VLP-16, mine/tunnel)
@@ -305,10 +305,15 @@ def run_iv_gicp(frames_gen, dataset_info, args, alpha=0.1):
         huber_delta=args.huber_delta,
         min_range=0.5,
         max_range=50.0,
-        adaptive_voxelization=args.adaptive,
         max_map_frames=args.max_map_frames,
-        map_radius=50.0,              # spatial eviction: keep map near robot (underground)
-        window_size=args.window_size,
+        map_radius=200.0,             # spatial eviction: keep map near robot (underground)
+        min_motion_th=0.5,            # sigma floor for mine/tunnel (prevents cascade failure)
+        auto_alpha=False,
+        auto_alpha_from_intensity=False,
+        source_drop_small_voxels=False,
+        source_max_output_features=0,
+        source_min_feature_score=0.0,
+        max_source_points=0,
         device=args.device,
     )
 
@@ -334,10 +339,6 @@ def run_iv_gicp(frames_gen, dataset_info, args, alpha=0.1):
             print(f"  frame {n:4d}  {elapsed_ms:6.0f}ms  {hz:.1f}Hz", flush=True)
 
     return poses, timestamps, times_ms
-
-
-def run_gicp_baseline(frames_gen, dataset_info, args):
-    return run_iv_gicp(frames_gen, dataset_info, args, alpha=0.0)
 
 
 def run_kiss(frames_gen, args):
@@ -405,20 +406,6 @@ def evaluate_dataset(dataset_name, args):
         results["IV-GICP"] = {"ate": ate, "path": path_len, "hz": 1000/avg_ms,
                                "n_frames": len(poses), "times": times}
 
-    # ── GICP Baseline ─────────────────────────────────────────────────────────
-    print(f"\n[GICP-Baseline] (alpha=0)")
-    gen = load_frames_from_zipped_bags(rosbag_zip, args.max_frames)
-    poses_b, timestamps_b, times_b = run_iv_gicp(gen, info, args, alpha=0.0)
-    if poses_b:
-        path_b = sum(np.linalg.norm(poses_b[i][:3,3] - poses_b[i-1][:3,3])
-                     for i in range(1, len(poses_b)))
-        ate_b, n_b = compute_ate(poses_b, gt_ts, gt_poses, timestamps_b)
-        avg_b = float(np.mean(times_b[1:])) if len(times_b) > 1 else float(times_b[0])
-        print(f"  ATE RMSE: {ate_b:.3f}m  path: {path_b:.1f}m  {1000/avg_b:.1f}Hz  "
-              f"({n_b}/{len(poses_b)} matched)")
-        results["GICP-Baseline"] = {"ate": ate_b, "path": path_b, "hz": 1000/avg_b,
-                                     "n_frames": len(poses_b), "times": times_b}
-
     # ── KISS-ICP ─────────────────────────────────────────────────────────────
     if _KISS_AVAILABLE:
         print(f"\n[KISS-ICP]")
@@ -467,14 +454,10 @@ def main():
                         help="Huber kernel threshold (0=disabled)")
     parser.add_argument("--alpha",     type=float, default=0.1,
                         help="Intensity weight (0=GICP)")
-    parser.add_argument("--adaptive",  action="store_true", default=False,
-                        help="Use adaptive voxelization (C1)")
     parser.add_argument("--max-map-frames", type=int, default=30,
                         help="Sliding window size in frames")
     parser.add_argument("--device",      default="auto",
                         help="Device: auto/cuda/cpu")
-    parser.add_argument("--window-size", type=int, default=1,
-                        help="FORM window smoothing size (1=disabled, e.g. 10)")
     parser.add_argument("--skip-genz",   action="store_true")
     args = parser.parse_args()
 

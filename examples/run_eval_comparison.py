@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
-IV-GICP vs KISS-ICP vs GICP-baseline comparison on KITTI sample data.
+IV-GICP (ablations) vs KISS-ICP on KITTI sample data.
 
-Outputs eval.md with ATE/RPE metrics and timing.
+Writes `eval.md` (ATE/RPE, timing) under `--output` (default: `output/eval/`). Not the same as removed `docs/eval.md`.
 
 Usage:
   uv run python examples/run_eval_comparison.py
@@ -104,18 +104,17 @@ def write_eval_md(results, data_path, n_frames, out_path):
 
     lines.append("---\n")
     lines.append("## Methods\n")
-    lines.append("| ID | Method | Adaptive Voxel | Intensity (4D) | Dist. Prop. |")
-    lines.append("|---|---|:---:|:---:|:---:|")
+    lines.append("| ID | Method | Adaptive Voxel | Intensity (4D) |")
+    lines.append("|---|---|:---:|:---:|")
     method_info = [
-        ("GICP Baseline", "✗", "✗", "✗"),
-        ("IV-GICP (Adaptive only)", "✓", "✗", "✗"),
-        ("IV-GICP (Intensity only)", "✗", "✓", "✗"),
-        ("IV-GICP (Full, no DP)", "✓", "✓", "✗"),
-        ("IV-GICP (Full)", "✓", "✓", "✓"),
-        ("KISS-ICP", "✓ (adaptive threshold)", "✗", "✗"),
+        ("IV-GICP (Adaptive only)", "✓", "✗"),
+        ("IV-GICP (Intensity only)", "✗", "✓"),
+        ("IV-GICP (Full, no DP)", "✓", "✓"),
+        ("IV-GICP (Full)", "✓", "✓"),
+        ("KISS-ICP", "✓ (adaptive threshold)", "✗"),
     ]
-    for i, (name, ada, inten, dp) in enumerate(method_info):
-        lines.append(f"| {i+1} | {name} | {ada} | {inten} | {dp} |")
+    for i, (name, ada, inten) in enumerate(method_info):
+        lines.append(f"| {i+1} | {name} | {ada} | {inten} |")
 
     lines.append("\n---\n")
     lines.append("## Results: Trajectory Accuracy\n")
@@ -154,7 +153,6 @@ def write_eval_md(results, data_path, n_frames, out_path):
     lines.append("- **RPE (Relative Pose Error):** 연속 프레임 간 상대 포즈 오차.")
     lines.append("- **KITTI t-err:** KITTI 공식 평가 지표 (경로 길이 대비 번역 오차 %).")
     lines.append("- **KISS-ICP:** geometry-only, adaptive voxel threshold. Intensity 미사용.")
-    lines.append("- **Dist. Prop.:** Retroactive distribution propagation (Lie theory 기반 복셀 통계 업데이트).")
     lines.append("- 모든 실험은 동일 KITTI Raw 시퀀스, 동일 다운샘플링 조건으로 수행.")
 
     out_path.parent.mkdir(parents=True, exist_ok=True)
@@ -204,52 +202,39 @@ def main():
 
     results = []
 
-    print("=== [1/6] GICP Baseline ===")
-    results.append(run_iv_gicp(frames_xyzI, poses_gt, "GICP Baseline",
-        alpha=0.0,
-        entropy_threshold=1e10,
-        intensity_var_threshold=1e10,
-        use_distribution_propagation=False,
-        **common,
-    ))
-
-    print("=== [2/6] IV-GICP (Adaptive only) ===")
+    print("=== [1/5] IV-GICP (Adaptive only) ===")
     results.append(run_iv_gicp(frames_xyzI, poses_gt, "IV-GICP (Adaptive only)",
         alpha=0.0,
         entropy_threshold=0.5,
         intensity_var_threshold=100.0,
-        use_distribution_propagation=False,
         **common,
     ))
 
-    print("=== [3/6] IV-GICP (Intensity only) ===")
+    print("=== [2/5] IV-GICP (Intensity only) ===")
     results.append(run_iv_gicp(frames_xyzI, poses_gt, "IV-GICP (Intensity only)",
         alpha=0.1,
         entropy_threshold=1e10,
         intensity_var_threshold=1e10,
-        use_distribution_propagation=False,
         **common,
     ))
 
-    print("=== [4/6] IV-GICP (Full, no DP) ===")
+    print("=== [3/5] IV-GICP (Full, no DP) ===")
     results.append(run_iv_gicp(frames_xyzI, poses_gt, "IV-GICP (Full, no DP)",
         alpha=0.1,
         entropy_threshold=0.5,
         intensity_var_threshold=0.01,
-        use_distribution_propagation=False,
         **common,
     ))
 
-    print("=== [5/6] IV-GICP (Full) ===")
+    print("=== [4/5] IV-GICP (Full) ===")
     results.append(run_iv_gicp(frames_xyzI, poses_gt, "IV-GICP (Full)",
         alpha=0.1,
         entropy_threshold=0.5,
         intensity_var_threshold=0.01,
-        use_distribution_propagation=True,
         **common,
     ))
 
-    print("=== [6/6] KISS-ICP ===")
+    print("=== [5/5] KISS-ICP ===")
     results.append(run_kiss_icp(frames_xyz, poses_gt))
 
     # Print summary

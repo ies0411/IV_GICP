@@ -1,42 +1,35 @@
 {
   "seq": "05",
   "n_frames": 500,
+  "iv_sparse_mode": null,
   "methods": {
     "KISS-ICP": {
-      "ate_rmse": 0.38014080109736453,
-      "ate_mean": 0.3456573243102051,
-      "kitti_t_err": 111.91693870321494,
-      "mean_ms": 21.279896651394665,
+      "ate_rmse": 0.3801408010973613,
+      "ate_mean": 0.3456573243102024,
+      "kitti_t_err": 111.91693870321495,
+      "mean_ms": 230.6876837927848,
       "n_frames": 500,
       "device": "cpu"
-    },
-    "GICP-Baseline": {
-      "ate_rmse": 0.3751920393995659,
-      "ate_mean": 0.3338345749544865,
-      "kitti_t_err": 111.73273306081582,
-      "mean_ms": 753.3020295057155,
-      "n_frames": 500,
-      "device": "cuda",
-      "reg_ms": 688.6528471955107,
-      "map_ms": 41.72089815658624
     },
     "IV-GICP": {
-      "ate_rmse": 0.37623013518177345,
-      "ate_mean": 0.33460408085093685,
-      "kitti_t_err": 111.73259085370508,
-      "mean_ms": 818.6183283124157,
+      "ate_rmse": 0.3510162821402525,
+      "ate_mean": 0.3169006338100628,
+      "kitti_t_err": 111.83569143497098,
+      "mean_ms": 207.30669757926123,
       "n_frames": 500,
-      "device": "cuda",
-      "reg_ms": 709.4771972323632,
-      "map_ms": 87.40900738168516
-    },
-    "GenZ-ICP": {
-      "ate_rmse": 0.3245004478529251,
-      "ate_mean": 0.29162472972070186,
-      "kitti_t_err": 111.78150057049749,
-      "mean_ms": NaN,
-      "n_frames": 500,
-      "device": "cpu"
+      "device": "cpu",
+      "reg_ms": 91.12697921297654,
+      "map_ms": 70.7228482936048,
+      "sparse_mode": null
     }
+  },
+  "speed_vs_kiss": {
+    "kiss_mean_ms": 230.90638381285305,
+    "iv_mean_ms": 207.30669757926123,
+    "ratio_iv_over_kiss": 0.8977954362114168,
+    "target_ratio_max": 1.5,
+    "hard_cap_ratio": 2.0,
+    "within_soft_budget": true,
+    "within_hard_cap": true
   }
 }

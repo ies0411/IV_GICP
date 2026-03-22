@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-MulRan Odometry Benchmark: IV-GICP vs KISS-ICP vs GICP-Baseline
+MulRan Odometry Benchmark: IV-GICP vs KISS-ICP
 
 Sequences available:
   /home/km/data/MulRan/DCC01/   — downtown campus (Ouster OS1-64)
@@ -18,7 +18,6 @@ Ouster timestamps from data_stamp.csv:
 Usage:
     uv run python examples/run_mulran_eval.py --seq DCC01 --max-frames 300
     uv run python examples/run_mulran_eval.py --seq DCC01 --max-frames 500 --alpha 0.1
-    uv run python examples/run_mulran_eval.py --seq DCC01 --max-frames 300 --window-size 5
 """
 
 import argparse
@@ -88,17 +87,25 @@ def load_ouster_timestamps(seq_dir: Path):
 
 
 def load_sequence(seq: str, max_frames: int = None):
-    """Load MulRan sequence → (frames, gt_timestamps, gt_poses, scan_timestamps)."""
+    """Load MulRan sequence → (frames, gt_timestamps, gt_poses, scan_timestamps).
+    Skips scan frames before GT coverage begins (GT starts ~13s after scan start).
+    """
     seq_dir  = MULRAN_ROOT / seq
     ouster_dir = seq_dir / "Ouster"
     gt_path    = seq_dir / "global_pose.csv"
 
-    # MulRan: scan files named by timestamp
+    gt_ts, gt_poses = load_mulran_gt(gt_path)
+
+    # MulRan: scan files named by timestamp; skip frames before GT coverage
     bins = sorted(ouster_dir.glob("*.bin"))
+    all_ts = np.array([int(b.stem) for b in bins], dtype=np.int64)
+    start_idx = int(np.searchsorted(all_ts, gt_ts[0]))
+    bins = bins[start_idx:]
+
     if max_frames:
         bins = bins[:max_frames]
 
-    print(f"[MulRan/{seq}/Ouster] Loading {len(bins)} frames...")
+    print(f"[MulRan/{seq}/Ouster] Loading {len(bins)} frames (skipped {start_idx} before GT)...")
     frames = []
     scan_timestamps = []
     for bf in bins:
@@ -106,7 +113,6 @@ def load_sequence(seq: str, max_frames: int = None):
         frames.append(pts)
         scan_timestamps.append(int(bf.stem))
 
-    gt_ts, gt_poses = load_mulran_gt(gt_path)
     scan_ts = np.array(scan_timestamps, dtype=np.int64)
     print(f"  GT poses: {len(gt_poses)}  scan pts avg: {np.mean([len(f) for f in frames]):.0f}")
     return frames, gt_ts, gt_poses, scan_ts
@@ -142,7 +148,7 @@ def compute_ate(est_poses, est_timestamps_ns, gt_timestamps_ns, gt_poses):
 # ── Method runners ─────────────────────────────────────────────────────────────
 
 def run_iv_gicp(frames, scan_ts, alpha, label, device, voxel_size=1.0,
-                max_map_frames=10, window_size=1, **kw):
+                max_map_frames=500, **kw):
     from iv_gicp.pipeline import IVGICPPipeline
     pipeline = IVGICPPipeline(
         voxel_size=voxel_size,
@@ -150,18 +156,21 @@ def run_iv_gicp(frames, scan_ts, alpha, label, device, voxel_size=1.0,
         alpha=alpha,
         max_correspondence_distance=2.0,
         initial_threshold=2.0,
-        min_motion_th=0.05,
-        max_iterations=30,
+        min_motion_th=0.1,
+        max_iterations=12,
         max_map_frames=max_map_frames,
         map_radius=80.0,              # spatial eviction: keep map near robot
-        adaptive_voxelization=False,
+        max_source_points=0,
+        auto_alpha=False,
+        auto_alpha_from_intensity=False,
+        source_drop_small_voxels=False,
+        source_max_output_features=0,
+        source_min_feature_score=0.0,
         device=device,
-        window_size=window_size,
-        use_distribution_propagation=False,
         **kw,
     )
     poses, times = [], []
-    print(f"\n[{label}] {len(frames)} frames  α={alpha}  voxel={voxel_size}  W={window_size}")
+    print(f"\n[{label}] {len(frames)} frames  α={alpha}  voxel={voxel_size}")
     for i, f in enumerate(frames):
         t0 = time.perf_counter()
         result = pipeline.process_frame(f[:, :3], f[:, 3], timestamp=float(scan_ts[i]))
@@ -203,12 +212,11 @@ def run_kiss_icp(frames, scan_ts, voxel_size=1.0):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--seq",        default="DCC01", choices=["DCC01"])
-    ap.add_argument("--max-frames", type=int, default=300)
-    ap.add_argument("--device",     default="cuda")
+    ap.add_argument("--max-frames", type=int, default=500)
+    ap.add_argument("--device",     default="cpu")
     ap.add_argument("--alpha",      type=float, default=0.1)
     ap.add_argument("--voxel-size", type=float, default=1.0)
-    ap.add_argument("--max-map-frames", type=int, default=10)
-    ap.add_argument("--window-size", type=int, default=1)
+    ap.add_argument("--max-map-frames", type=int, default=500)
     ap.add_argument("--skip-kiss",  action="store_true")
     args = ap.parse_args()
 
@@ -218,18 +226,10 @@ def main():
     out_dir = RESULTS_ROOT / args.seq
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    # GICP-Baseline
-    poses, _ = run_iv_gicp(frames, scan_ts, alpha=0.0, label="GICP-Baseline",
-                            device=args.device, voxel_size=args.voxel_size,
-                            max_map_frames=args.max_map_frames, window_size=args.window_size)
-    ate = compute_ate(poses, scan_ts, gt_ts, gt_poses)
-    results["gicp_baseline"] = ate
-    print(f"  ATE RMSE: {ate:.4f}m")
-
     # IV-GICP
     poses, _ = run_iv_gicp(frames, scan_ts, alpha=args.alpha, label=f"IV-GICP (α={args.alpha})",
                             device=args.device, voxel_size=args.voxel_size,
-                            max_map_frames=args.max_map_frames, window_size=args.window_size)
+                            max_map_frames=args.max_map_frames)
     ate = compute_ate(poses, scan_ts, gt_ts, gt_poses)
     results[f"iv_gicp_a{args.alpha}"] = ate
     print(f"  ATE RMSE: {ate:.4f}m")
@@ -243,7 +243,7 @@ def main():
 
     # Summary
     print(f"\n{'='*55}")
-    print(f"MulRan/{args.seq}  {args.max_frames}fr  voxel={args.voxel_size}  W={args.window_size}")
+    print(f"MulRan/{args.seq}  {args.max_frames}fr  voxel={args.voxel_size}")
     print(f"{'Method':<25} {'ATE(m)':>8}")
     print(f"{'-'*35}")
     for k, v in results.items():

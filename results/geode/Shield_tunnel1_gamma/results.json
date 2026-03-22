@@ -2,29 +2,29 @@
   "meta": {
     "seq": "Shield_tunnel1_gamma",
     "bag": "/home/km/data/GEODE/sensor_data/Metro_tunnel/Shield_tunnel1_gamma/Shield_tunnel1_gamma.bag",
-    "n_frames": 300,
-    "duration_s": 29.899728775024414,
-    "avg_pts_per_frame": 23683.926666666666,
-    "gt_path_m": 28.345782528227062,
-    "gt_end_disp_m": 28.130997794959267
+    "n_frames": 500,
+    "duration_s": 49.89989113807678,
+    "avg_pts_per_frame": 23702.44,
+    "gt_path_m": 59.1525655963176,
+    "gt_end_disp_m": 58.84754977346132
   },
   "methods": {
     "KISS-ICP": {
-      "mean_ms": 10.310993303234378,
-      "hz": 96.98386669364993,
-      "path_length_m": 35.686129109631835,
-      "end_displacement_m": 0.7392177365687991,
-      "ate_rmse_m": 9.111549191225896,
-      "n_frames": 300
+      "mean_ms": 545.6622773967683,
+      "hz": 1.832635389000637,
+      "path_length_m": 70.45400905920971,
+      "end_displacement_m": 4.41862871555074,
+      "ate_rmse_m": 17.616965534499858,
+      "n_frames": 500
     },
     "IV-GICP": {
-      "mean_ms": 119.10496962982477,
-      "hz": 8.395955291437248,
-      "path_length_m": 19.161771805557624,
-      "end_displacement_m": 8.020149371250932,
-      "ate_rmse_m": 6.249088363277198,
-      "n_frames": 300,
-      "device": "cuda"
+      "mean_ms": 347.649815324358,
+      "hz": 2.8764577339613946,
+      "path_length_m": 44.22200394762761,
+      "end_displacement_m": 3.1498968688725575,
+      "ate_rmse_m": 18.668222019407708,
+      "n_frames": 500,
+      "device": "cpu"
     }
   }
 }

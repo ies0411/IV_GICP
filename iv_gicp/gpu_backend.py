@@ -1,20 +1,14 @@
 """
-GPU Backend for IV-GICP: PyTorch-accelerated batch operations.
+Optional PyTorch batch helpers for IV-GICP Python-side voxel prep (e.g. IVGICP.register).
 
-Replaces the three main Python-loop bottlenecks with single GPU calls:
-  1. batch_intensity_gradients()  — n×lstsq loops → 1 torch.linalg.lstsq call
-  2. batch_precision_matrices()   — n×pinv loops  → 1 torch.linalg.inv call
-  3. gn_hessian_gradient()        — numpy einsums → torch.einsum on GPU
+  - batch_intensity_gradients
+  - batch_precision_matrices
 
-Design principles:
-  - float64 throughout (preserve accuracy identical to numpy)
-  - numpy in → numpy out (transparent to callers)
-  - graceful CPU fallback when torch is unavailable or device='cpu'
-  - target arrays pre-transferred to GPU at map-build time (not per GN iteration)
+Registration itself runs in C++ (iv_gicp_core); these are numpy in → numpy out.
 """
 
 import numpy as np
-from typing import Optional, Tuple, Union
+from typing import Optional, Union
 
 # ─── Torch availability ───────────────────────────────────────────────────────
 
@@ -127,10 +121,7 @@ def batch_precision_matrices(
     """
     Build all 4×4 precision matrices in a single batched GPU call.
 
-    Used by pipeline._build_voxels_from_adaptive_map() (Python path) for batch precision:
-      for leaf in leaves:
-        C = build_combined_covariance(cov, var_I, vsize, alpha)
-        C_inv = np.linalg.pinv(C + 1e-6 * I)
+    Used by IVGICP._build_target_map when building a target voxel grid in Python.
 
     Batched as:
       Omega (n, 4, 4) block-diagonal information matrix
@@ -206,192 +197,3 @@ def batch_precision_matrices(
     Omega_t[:, 3, 3] = omega_I_t
 
     return Omega_t.cpu().numpy()  # (n, 4, 4)
-
-
-# ─── 3. GPU-accelerated GN Hessian/gradient accumulation ─────────────────────
-
-
-def gn_hessian_gradient(
-    src_valid: np.ndarray,  # (M', 3) transformed source points
-    src_int_valid: np.ndarray,  # (M',)   source intensities
-    t_means_gpu,  # (M', 4) GPU tensor (pre-cached target means)
-    t_prec_gpu,  # (M', 4, 4) GPU tensor (pre-cached precisions)
-    t_grad_gpu,  # (M', 3) GPU tensor (pre-cached intensity grads)
-    R_cur: np.ndarray,  # (3, 3) current rotation
-    alpha: float,
-    device,
-    weights: Optional[np.ndarray] = None,  # (M',) per-point Huber/Cauchy weights
-) -> Tuple[np.ndarray, np.ndarray]:  # H (6,6), b (6,)
-    """
-    GPU-accelerated Gauss-Newton Hessian and gradient accumulation.
-
-    Replaces the three einsum calls in _gauss_newton_vectorized():
-      JtC = einsum('mji,mjk->mik', J, t_prec)         (M', 6, 4)
-      H   = einsum('mij,m,mjk->ik',  JtC, w, J)       (6, 6)  ← per-point weights
-      b   = einsum('mij,m,mj->i',    JtC, w, d)       (6,)    ← per-point weights
-
-    Target arrays (t_means, t_prec, t_grad) are pre-cached on GPU and indexed
-    by valid correspondence indices to avoid per-iteration full transfers.
-
-    Falls back to numpy if device is None (t_means_gpu etc. are then numpy arrays).
-    """
-    if device is None:
-        # Pure numpy fallback
-        # Ensure inputs are numpy for fallback
-        def _to_np(x):
-            if _TORCH_AVAILABLE and isinstance(x, torch.Tensor):
-                return x.cpu().numpy()
-            return np.asarray(x)
-
-        return _gn_hessian_numpy(
-            src_valid, src_int_valid, _to_np(t_means_gpu), _to_np(t_prec_gpu), _to_np(t_grad_gpu), R_cur, alpha, weights
-        )
-
-    M = len(src_valid)
-    I3 = torch.eye(3, dtype=torch.float64, device=device)
-
-    # Transfer small per-iteration arrays (source side only)
-    src_t = torch.tensor(np.asarray(src_valid), dtype=torch.float64, device=device)
-    src_i = torch.tensor(np.asarray(src_int_valid), dtype=torch.float64, device=device)
-    R_t = torch.tensor(np.asarray(R_cur), dtype=torch.float64, device=device)
-
-    # Ensure target arrays are torch tensors on the correct device
-    def _to_torch(x):
-        if isinstance(x, torch.Tensor):
-            return x.to(device=device, dtype=torch.float64)
-        return torch.tensor(np.asarray(x), dtype=torch.float64, device=device)
-
-    t_means = _to_torch(t_means_gpu)  # (M', 4)
-    t_prec = _to_torch(t_prec_gpu)  # (M', 4, 4)
-    t_grad = _to_torch(t_grad_gpu)  # (M', 3)
-
-    # Per-point Huber/Cauchy weights (default: uniform)
-    if weights is not None:
-        w_t = torch.tensor(np.asarray(weights), dtype=torch.float64, device=device)
-    else:
-        w_t = torch.ones(M, dtype=torch.float64, device=device)
-
-    # 4D Residual  (src_t is already the TRANSFORMED source: q = R@p + t)
-    d_xyz = src_t - t_means[:, :3]  # (M', 3)
-    d_i = alpha * src_i - t_means[:, 3]  # (M',)
-    d = torch.cat([d_xyz, d_i.unsqueeze(-1)], dim=-1)  # (M', 4)
-
-    # Jacobian J_xyz (M', 3, 6) for left SE(3) perturbation: T_new = exp(ξ) @ T_cur
-    # J_xyz[i] = [-skew(q_i), I_3]  where q_i = T_cur @ p_s = R@p_s + t (= src_t)
-    # src_t is already the transformed source q = R@p + t (NOT p_s), so Rp = src_t.
-    Rp = src_t  # (M', 3) = q = R@p_s + t  (already transformed, no extra R needed)
-    J_xyz = torch.zeros(M, 3, 6, dtype=torch.float64, device=device)
-    J_xyz[:, 0, 1] = Rp[:, 2]
-    J_xyz[:, 0, 2] = -Rp[:, 1]
-    J_xyz[:, 1, 0] = -Rp[:, 2]
-    J_xyz[:, 1, 2] = Rp[:, 0]
-    J_xyz[:, 2, 0] = Rp[:, 1]
-    J_xyz[:, 2, 1] = -Rp[:, 0]
-    J_xyz[:, :, 3:6] = I3.unsqueeze(0)  # broadcast (1,3,3)
-
-    # Full Jacobian J (M', 4, 6)
-    J = torch.zeros(M, 4, 6, dtype=torch.float64, device=device)
-    J[:, :3, :] = J_xyz
-    J[:, 3, :] = -alpha * torch.einsum("mi,mij->mj", t_grad, J_xyz)
-
-    # Weighted Hessian and gradient accumulation (per-point Huber/Cauchy)
-    JtC = torch.einsum("mji,mjk->mik", J, t_prec)  # (M', 6, 4)
-    H = torch.einsum("mij,m,mjk->ik", JtC, w_t, J)  # (6, 6)
-    b = torch.einsum("mij,m,mj->i", JtC, w_t, d)  # (6,)
-
-    return H.cpu().numpy(), b.cpu().numpy()
-
-
-def _gn_hessian_numpy(
-    src_valid,
-    src_int_valid,
-    t_means,
-    t_prec,
-    t_grad,
-    R_cur,
-    alpha,
-    weights=None,
-) -> Tuple[np.ndarray, np.ndarray]:
-    """Pure numpy fallback for gn_hessian_gradient (identical math)."""
-    M = len(src_valid)
-    I3 = np.eye(3)
-
-    # src_valid is already the TRANSFORMED source: q = R@p + t
-    d_xyz = src_valid - t_means[:, :3]
-    d_i = alpha * src_int_valid - t_means[:, 3]
-    d = np.column_stack([d_xyz, d_i])
-
-    # Per-point weights (default: uniform)
-    w = weights if weights is not None else np.ones(M)
-
-    # Jacobian for left SE(3) perturbation: Rp = q = R@p + t (= src_valid, already transformed)
-    Rp = src_valid  # (M', 3) — no extra R needed
-    J_xyz = np.zeros((M, 3, 6))
-    J_xyz[:, 0, 1] = Rp[:, 2]
-    J_xyz[:, 0, 2] = -Rp[:, 1]
-    J_xyz[:, 1, 0] = -Rp[:, 2]
-    J_xyz[:, 1, 2] = Rp[:, 0]
-    J_xyz[:, 2, 0] = Rp[:, 1]
-    J_xyz[:, 2, 1] = -Rp[:, 0]
-    J_xyz[:, :, 3:6] = I3[np.newaxis]
-
-    J = np.zeros((M, 4, 6))
-    J[:, :3, :] = J_xyz
-    J[:, 3, :] = -alpha * np.einsum("mi,mij->mj", t_grad, J_xyz)
-
-    JtC = np.einsum("mji,mjk->mik", J, t_prec)
-    H = np.einsum("mij,m,mjk->ik", JtC, w, J)  # per-point weighted
-    b = np.einsum("mij,m,mj->i", JtC, w, d)  # per-point weighted
-    return H, b
-
-
-# ─── 4. GPU cache helpers ─────────────────────────────────────────────────────
-
-
-class TargetGPUCache:
-    """
-    Holds target voxel arrays on GPU between GN iterations.
-
-    Workflow:
-      cache = TargetGPUCache(device)
-      cache.load(means_4d, precisions, grads)   # once per map rebuild
-      ...
-      # Inside GN loop (per iteration):
-      t_means, t_prec, t_grad = cache.gather(tidx)  # index into GPU arrays
-    """
-
-    def __init__(self, device):
-        self.device = device
-        self._means_gpu = None  # (M_full, 4)
-        self._prec_gpu = None  # (M_full, 4, 4)
-        self._grads_gpu = None  # (M_full, 3)
-
-    def load(
-        self,
-        means_4d: np.ndarray,  # (M, 4)
-        precisions: np.ndarray,  # (M, 4, 4)
-        grads: np.ndarray,  # (M, 3)
-    ) -> None:
-        """Transfer full target arrays to GPU. Call once per map rebuild."""
-        if self.device is None:
-            self._means_gpu = means_4d
-            self._prec_gpu = precisions
-            self._grads_gpu = grads
-            return
-        self._means_gpu = torch.tensor(means_4d, dtype=torch.float64, device=self.device)
-        self._prec_gpu = torch.tensor(precisions, dtype=torch.float64, device=self.device)
-        self._grads_gpu = torch.tensor(grads, dtype=torch.float64, device=self.device)
-
-    def gather(self, tidx: np.ndarray):
-        """
-        Index into GPU arrays by correspondence indices.
-        Returns (means, prec, grads) as GPU tensors (or numpy if device=None).
-        """
-        if self.device is None:
-            return (self._means_gpu[tidx], self._prec_gpu[tidx], self._grads_gpu[tidx])
-        tidx_t = torch.tensor(tidx, dtype=torch.long, device=self.device)
-        return (self._means_gpu[tidx_t], self._prec_gpu[tidx_t], self._grads_gpu[tidx_t])
-
-    @property
-    def is_loaded(self) -> bool:
-        return self._means_gpu is not None

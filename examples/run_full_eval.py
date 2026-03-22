@@ -1,467 +1,532 @@
 #!/usr/bin/env python3
 """
-IV-GICP Full Evaluation: Ablation + Method Comparison.
+IV-GICP Full Evaluation — 전체 프레임 병렬 실행
+=================================================
+각 시퀀스를 끝까지 실행하고 IV-GICP vs KISS-ICP ATE/RPE를 비교합니다.
+시퀀스별 독립 프로세스로 병렬 실행.
 
-Methods:
-  A  GICP Baseline        (geometry-only, fixed voxels)
-  B  + Adaptive only      (entropy-based voxelization, no intensity)
-  C  + Intensity only     (fixed voxels, 4D covariance)
-  D  IV-GICP w/o DP       (adaptive + intensity, no dist.prop.)
-  E  IV-GICP Full [GPU]   (all three components, CUDA)
-  F  KISS-ICP             (geometry-only, C++ backend, adaptive threshold)
-  G  GenZ-ICP (proxy)     (geometry-only + planarity adaptive weight, κ tracking)
-                           Note: Official GenZ-ICP is C++/ROS2 only. This proxy
-                           replicates the core adaptive-weighting idea (Lee et al.,
-                           RA-L 2025) in Python using our framework.
+출력:
+    results/full_eval/<dataset>/<seq>/results.json   — 시퀀스별
+    results/full_eval/summary.json                   — 전체 요약
+    results/full_eval/summary.md                     — 마크다운 표
 
 Usage:
-  python examples/run_full_eval.py --max-frames 15
-  python examples/run_full_eval.py --max-frames 20 --device cuda
+    uv run python examples/run_full_eval.py                        # 전체, 병렬
+    uv run python examples/run_full_eval.py --workers 4            # 최대 4개 동시
+    uv run python examples/run_full_eval.py --dataset kitti        # 특정 도메인
+    uv run python examples/run_full_eval.py --seq "KITTI seq05"    # 단일 시퀀스
+    uv run python examples/run_full_eval.py --no-parallel          # 순차 실행
+    uv run python examples/run_full_eval.py --no-skip              # 기존 결과 무시 재실행
 """
 
 import argparse
+import json
 import sys
 import time
+import multiprocessing
+import subprocess
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-
 import numpy as np
-from iv_gicp import IVGICPPipeline
-from iv_gicp.kitti_loader import load_kitti_sequence
-from iv_gicp.metrics import compute_ate, compute_rpe, compute_rpe_kitti
-from iv_gicp.degeneracy_analysis import genz_icp_condition_number
+
+ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(ROOT))
+sys.path.insert(0, str(ROOT / "examples"))
+
+# ── Dataset paths ──────────────────────────────────────────────────────────────
+KITTI_ROOT  = Path("/home/km/data/kitti/dataset")
+SUBT_ROOT   = Path("/home/km/data/SubT-MRS")
+GEODE_ROOT  = Path("/home/km/data/GEODE")
+MULRAN_ROOT = Path("/home/km/data/MulRan")
+
+# ── Best params per domain ─────────────────────────────────────────────────────
+
+def _kitti_iv():
+    # max_map_frames=500 keeps ~1.3km of map context for KITTI's long loop sequences.
+    # mf=10 was too small → old map evicted at turns → cumulative drift.
+    return dict(voxel_size=1.0, source_voxel_size=0.3, alpha=0.1,
+                max_correspondence_distance=2.0, initial_threshold=2.0,
+                max_map_frames=500, max_iterations=30, min_range=0.5, max_range=80.0,
+                auto_alpha=False, auto_alpha_from_intensity=False,
+                source_drop_small_voxels=False, source_max_output_features=0,
+                source_min_feature_score=0.0, max_source_points=0)
+
+def _kitti_k():  return dict(voxel_size=1.0,  min_range=0.5, max_range=80.0)
+
+def _geode_urban_iv():
+    # min_motion_th=0.5 (=initial_threshold/3=1.5/3): uniform concrete tunnels
+    # need wider sigma floor to maintain enough correspondences (same as SubT).
+    return dict(voxel_size=0.5, source_voxel_size=0.25, alpha=0.0,
+                max_correspondence_distance=2.0, initial_threshold=1.5,
+                max_map_frames=500, max_iterations=30, min_range=0.5, max_range=80.0,
+                map_radius=80.0, min_motion_th=0.5,
+                auto_alpha=False, auto_alpha_from_intensity=False,
+                source_drop_small_voxels=False, source_max_output_features=0,
+                source_min_feature_score=0.0, max_source_points=0)
+
+def _geode_urban_k(): return dict(voxel_size=0.5, min_range=0.5, max_range=80.0)
+
+def _metro_iv():
+    # min_motion_th=0.5: sigma floor = initial_threshold/3 = 1.5/3 = 0.5m (KISS-ICP formula).
+    # max_map_frames=200: keeps recent 200 frames; spatial eviction (60m) handles old voxels.
+    return dict(voxel_size=0.5, source_voxel_size=0.2, alpha=0.5,
+                max_correspondence_distance=1.5, initial_threshold=1.5,
+                max_map_frames=200, max_iterations=30, min_range=0.5, max_range=60.0,
+                map_radius=60.0, min_motion_th=0.5,
+                auto_alpha=False, auto_alpha_from_intensity=False,
+                source_drop_small_voxels=False, source_max_output_features=0,
+                source_min_feature_score=0.0, max_source_points=0)
+
+def _metro_k(): return dict(voxel_size=0.5, min_range=0.5, max_range=60.0)
+
+def _subt_iv():
+    # min_motion_th=0.5 matches KISS-ICP's initial_threshold/3 = 1.5/3 = 0.5m.
+    # Without this, sigma collapses to 0.1m → adaptive_corr=0.3m → too tight
+    # for sparse VLP-16 in mine junctions → poor_registration cascade failure.
+    return dict(voxel_size=0.5, source_voxel_size=0.3, alpha=0.1,
+                max_correspondence_distance=2.0, initial_threshold=1.5,
+                max_map_frames=200, max_iterations=30, min_range=0.3, max_range=80.0,
+                map_radius=200.0, min_motion_th=0.5,
+                auto_alpha=False, auto_alpha_from_intensity=False,
+                source_drop_small_voxels=False, source_max_output_features=0,
+                source_min_feature_score=0.0, max_source_points=0)
+
+def _subt_k(): return dict(voxel_size=0.5, min_range=0.3, max_range=80.0)
+
+def _mulran_iv():
+    # map_radius=None, max_map_frames=500: age-based eviction works better than
+    # spatial for outdoor loops. Large spatial radius creates wrong far correspondences.
+    return dict(voxel_size=1.0, source_voxel_size=0.3, alpha=0.1,
+                max_correspondence_distance=2.0, initial_threshold=2.0,
+                max_map_frames=500, max_iterations=30, min_range=0.5, max_range=80.0,
+                auto_alpha=False, auto_alpha_from_intensity=False,
+                source_drop_small_voxels=False, source_max_output_features=0,
+                source_min_feature_score=0.0, max_source_points=0)
+
+def _mulran_k(): return dict(voxel_size=1.0, min_range=0.5, max_range=80.0)
+
+def _helipr_iv():
+    return dict(voxel_size=1.0, source_voxel_size=0.3, alpha=0.1,
+                max_correspondence_distance=2.0, initial_threshold=2.0,
+                max_map_frames=500, max_iterations=30, min_range=0.5, max_range=80.0,
+                map_radius=400.0,
+                auto_alpha=False, auto_alpha_from_intensity=False,
+                source_drop_small_voxels=False, source_max_output_features=0,
+                source_min_feature_score=0.0, max_source_points=0)
+
+def _helipr_k(): return dict(voxel_size=1.0, min_range=0.5, max_range=80.0)
 
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Shared metric helper
-# ──────────────────────────────────────────────────────────────────────────────
-def _eval(poses, poses_gt, frame_times, label, extra=None):
-    result = {"label": label, "n_frames": len(poses)}
-    if poses_gt is not None and len(poses_gt) == len(poses):
-        ate_rmse, ate_mean, _ = compute_ate(poses, poses_gt, align=True)
-        rpe_rmse, rpe_mean = compute_rpe(poses, poses_gt)
-        kitti_m = compute_rpe_kitti(poses, poses_gt)
-        result.update(
-            {
-                "ate_rmse": round(ate_rmse, 4),
-                "ate_mean": round(ate_mean, 4),
-                "rpe_rmse": round(rpe_rmse, 4),
-                "rpe_mean": round(rpe_mean, 4),
-                "kitti_t_err_pct": round(kitti_m.get("t_err_pct", float("nan")), 4),
-                "kitti_r_err_deg_m": round(kitti_m.get("r_err_deg_m", float("nan")), 6),
-            }
-        )
-    result["avg_frame_ms"] = round(np.mean(frame_times) * 1000, 1)
-    result["total_time_s"] = round(sum(frame_times), 2)
-    if extra:
-        result.update(extra)
-    return result
+# ── Sequence registry ──────────────────────────────────────────────────────────
+
+def build_sequences():
+    seqs = []
+
+    # KITTI seq00~10
+    for i in range(11):
+        seq = f"{i:02d}"
+        velo  = KITTI_ROOT / "sequences" / seq / "velodyne"
+        poses = KITTI_ROOT / "poses" / f"{seq}.txt"
+        if velo.exists() and poses.exists():
+            seqs.append({"label": f"KITTI seq{seq}", "domain": "kitti",
+                         "loader": "load_kitti", "loader_kw": {"seq": seq},
+                         "iv_params": _kitti_iv(), "kiss_params": _kitti_k(),
+                         "out_dir": f"kitti/seq{seq}"})
+
+    # GEODE Urban_Tunnel 01/02/03
+    for s in ("01", "02", "03"):
+        d = GEODE_ROOT / f"sensor_data/Urban_tunnel/Urban_Tunnel{s}"
+        if d.exists():
+            seqs.append({"label": f"GEODE Urban_Tunnel{s}", "domain": "geode_urban",
+                         "loader": "load_geode_tunnel", "loader_kw": {"seq": s},
+                         "iv_params": _geode_urban_iv(), "kiss_params": _geode_urban_k(),
+                         "out_dir": f"geode/Urban_Tunnel{s}"})
+
+    # GEODE Metro Shield_tunnel 1/2/3
+    for tid in (1, 2, 3):
+        d = GEODE_ROOT / f"sensor_data/Metro_tunnel/Shield_tunnel{tid}_gamma"
+        if d.exists():
+            seqs.append({"label": f"GEODE Metro Shield_tunnel{tid}", "domain": "metro",
+                         "loader": "load_metro", "loader_kw": {"tunnel_id": tid},
+                         "iv_params": _metro_iv(), "kiss_params": _metro_k(),
+                         "out_dir": f"geode/Metro_Shield_tunnel{tid}"})
+
+    # MulRan
+    for seq in ("DCC01", "KAIST01", "Riverside01"):
+        if (MULRAN_ROOT / seq / "Ouster").exists():
+            seqs.append({"label": f"MulRan {seq}", "domain": "mulran",
+                         "loader": "load_mulran", "loader_kw": {"seq": seq},
+                         "iv_params": _mulran_iv(), "kiss_params": _mulran_k(),
+                         "out_dir": f"mulran/{seq}"})
+
+    # SubT-MRS
+    subt_keys = [
+        "SubT_MRS_Final_Challenge_UGV1",  "SubT_MRS_Final_Challenge_UGV2",
+        "SubT_MRS_Final_Challenge_UGV3",  "SubT_MRS_Laurel_Caverns_Handheld3",
+        "SubT_MRS_Urban_Challenge_UGV1",  "SubT_MRS_Urban_Challenge_UGV2",
+    ]
+    for key in subt_keys:
+        gt = SUBT_ROOT / "LiDAR_Inertial_Track" / key / "ground_truth_path.csv"
+        if gt.exists():
+            short = key[9:]
+            seqs.append({"label": f"SubT {short}", "domain": "subt",
+                         "loader": "load_subt", "loader_kw": {"bag_key": key},
+                         "iv_params": _subt_iv(), "kiss_params": _subt_k(),
+                         "out_dir": f"subt/{short}"})
+
+    # HeLiPR
+    helipr_root = Path("/home/km/data/HeLiPR")
+    for seq in ("DCC05", "KAIST05", "Roundabout01"):
+        if (helipr_root / seq).exists():
+            seqs.append({"label": f"HeLiPR {seq}", "domain": "helipr",
+                         "loader": "load_helipr", "loader_kw": {"seq": seq},
+                         "iv_params": _helipr_iv(), "kiss_params": _helipr_k(),
+                         "out_dir": f"helipr/{seq}"})
+
+    return seqs
 
 
-# ──────────────────────────────────────────────────────────────────────────────
-# IV-GICP runner
-# ──────────────────────────────────────────────────────────────────────────────
-def run_iv_gicp(frames_xyzI, poses_gt, label, device="auto", **kwargs):
-    pipeline = IVGICPPipeline(device=device, **kwargs)
-    poses, frame_times = [], []
-    for pts in frames_xyzI:
-        t0 = time.perf_counter()
-        pipeline.process_frame(pts)
-        frame_times.append(time.perf_counter() - t0)
-        poses.append(pipeline.get_trajectory().poses[-1].copy())
-    return _eval(poses, poses_gt, frame_times, label)
+# ── Metrics ────────────────────────────────────────────────────────────────────
+
+def ate_rmse(poses_est, poses_gt):
+    n = min(len(poses_est), len(poses_gt))
+    if n < 2: return float("nan")
+    t_est = np.array([p[:3, 3] for p in poses_est[:n]])
+    t_gt  = np.array([p[:3, 3] for p in poses_gt[:n]])
+    mu_e, mu_g = t_est.mean(0), t_gt.mean(0)
+    H = (t_est - mu_e).T @ (t_gt - mu_g)
+    U, _, Vt = np.linalg.svd(H)
+    D = np.eye(3); D[2, 2] = 1.0 if np.linalg.det(Vt.T @ U.T) > 0 else -1.0
+    R = Vt.T @ D @ U.T; tv = mu_g - R @ mu_e
+    errs = np.array([np.linalg.norm(R @ p[:3,3] + tv - g[:3,3])
+                     for p, g in zip(poses_est[:n], poses_gt[:n])])
+    return float(np.sqrt(np.mean(errs**2)))
 
 
-# ──────────────────────────────────────────────────────────────────────────────
-# KISS-ICP runner
-# ──────────────────────────────────────────────────────────────────────────────
-def run_kiss_icp(frames_xyz, poses_gt):
-    from kiss_icp.kiss_icp import KissICP
-    from kiss_icp.config import KISSConfig
-
-    cfg = KISSConfig()
-    cfg.data.max_range = 80.0
-    cfg.data.min_range = 2.0
-    cfg.data.deskew = False
-    cfg.mapping.voxel_size = 1.0
-    kiss = KissICP(config=cfg)
-
-    poses, frame_times = [], []
-    for i, pts in enumerate(frames_xyz):
-        pts = np.asarray(pts, dtype=np.float64)
-        valid = np.isfinite(pts).all(axis=1)
-        pts = pts[valid]
-        if pts.shape[0] < 100:
-            poses.append(poses[-1].copy() if poses else np.eye(4))
-            frame_times.append(0.0)
-            continue
-        timestamps = np.full(pts.shape[0], float(i), dtype=np.float64)
-        t0 = time.perf_counter()
-        kiss.register_frame(pts, timestamps)
-        frame_times.append(time.perf_counter() - t0)
-        poses.append(kiss.last_pose.copy())
-
-    return _eval(poses, poses_gt, frame_times, "KISS-ICP")
+def rpe_rmse(poses_est, poses_gt, delta=1):
+    n = min(len(poses_est), len(poses_gt))
+    if n < delta + 1: return float("nan")
+    errs = []
+    for i in range(n - delta):
+        dE = np.linalg.inv(poses_est[i]) @ poses_est[i + delta]
+        dG = np.linalg.inv(poses_gt[i])  @ poses_gt[i + delta]
+        errs.append(np.linalg.norm((np.linalg.inv(dG) @ dE)[:3, 3]))
+    return float(np.sqrt(np.mean(np.array(errs)**2)))
 
 
-# ──────────────────────────────────────────────────────────────────────────────
-# GenZ-ICP proxy runner
-#
-# Official GenZ-ICP (Lee et al., RA-L 2025) is C++/ROS2 only:
-#   https://github.com/cocel-postech/genz-icp
-#
-# This proxy replicates the core idea in Python:
-#   1. Use our geometry-only pipeline (alpha=0, adaptive voxels enabled)
-#   2. After each frame, extract GN Hessian via FIM, compute κ
-#   3. Track κ per frame to show when GenZ-ICP would flag degeneracy
-#
-# Note: true GenZ-ICP mixes point-to-plane / point-to-point with
-#   α = N_plane/(N_plane+N_point); our proxy uses entropy-based adaptation
-#   which approximates the same goal (adapt resolution to geometry complexity).
-# ──────────────────────────────────────────────────────────────────────────────
-def run_genz_proxy(frames_xyzI, poses_gt, device="auto"):
-    """
-    GenZ-ICP proxy: geometry-only IV-GICP pipeline + per-frame κ tracking.
-    Planarity ratio computed from voxel eigenvalue structure (local covariance).
-    """
-    from iv_gicp import IVGICP
+# ── Loaders ────────────────────────────────────────────────────────────────────
 
-    pipeline = IVGICPPipeline(
-        device=device,
-        alpha=0.0,  # geometry only — no intensity
-        entropy_threshold=0.5,  # adaptive voxelization (like GenZ-ICP's adaptive threshold)
-        intensity_var_threshold=1e10,  # disabled
-        use_distribution_propagation=False,
-        voxel_size=1.0,
-        max_correspondence_distance=5.0,
-        max_range=80.0,
-        min_range=2.0,
-        source_voxel_size=0.3,
-        max_map_points=200_000,
-    )
+def load_kitti(seq="00", max_frames=None):
+    velo_dir = KITTI_ROOT / "sequences" / seq / "velodyne"
+    bins = sorted(velo_dir.glob("*.bin"))
+    if max_frames: bins = bins[:max_frames]
+    frames = []
+    for b in bins:
+        raw = np.fromfile(b, dtype=np.float32).reshape(-1, 4).astype(np.float64)
+        r = np.linalg.norm(raw[:, :3], axis=1)
+        frames.append(raw[(r > 0.5) & (r < 80.0)])
+    gt = []
+    for line in (KITTI_ROOT / "poses" / f"{seq}.txt").read_text().splitlines():
+        v = list(map(float, line.split()))
+        T = np.eye(4); T[:3, :] = np.array(v).reshape(3, 4)
+        gt.append(T)
+    n = min(len(frames), len(gt))
+    return frames[:n], gt[:n]
 
-    poses, frame_times, kappas, planarity_ratios = [], [], [], []
 
-    for i, pts in enumerate(frames_xyzI):
-        t0 = time.perf_counter()
-        pipeline.process_frame(pts)
-        frame_times.append(time.perf_counter() - t0)
-        poses.append(pipeline.get_trajectory().poses[-1].copy())
+def load_geode_tunnel(seq="01", max_frames=None):
+    import run_ablation as ra
+    return ra.load_geode_tunnel(max_frames=max_frames or 99999, seq=seq)
 
-        # Per-frame κ (GenZ-ICP degeneracy metric) via flat_map voxel covariances
+
+def load_metro(tunnel_id=1, max_frames=None):
+    import run_ablation as ra
+    return ra.load_metro(max_frames=max_frames or 99999, tunnel_id=tunnel_id)
+
+
+def load_subt(bag_key="SubT_MRS_Final_Challenge_UGV1", max_frames=None):
+    import run_ablation as ra
+    return ra.load_subt(max_frames=max_frames or 99999, bag_key=bag_key)
+
+
+def load_mulran(seq="DCC01", max_frames=None):
+    seq_dir = MULRAN_ROOT / seq
+    bins = sorted((seq_dir / "Ouster").glob("*.bin"))
+    if max_frames: bins = bins[:max_frames]
+    frames = []
+    for b in bins:
+        raw = np.fromfile(b, dtype=np.float32).reshape(-1, 4).astype(np.float64)
+        r = np.linalg.norm(raw[:, :3], axis=1)
+        frames.append(raw[(r > 0.5) & (r < 100.0)])
+    gt_ts_all, gt_all = [], []
+    for line in (seq_dir / "global_pose.csv").read_text().splitlines():
+        v = list(map(float, line.strip().split(',')))
+        R = np.array([[v[1],v[2],v[3]],[v[5],v[6],v[7]],[v[9],v[10],v[11]]])
+        t = np.array([v[4],v[8],v[12]])
+        T = np.eye(4); T[:3,:3]=R; T[:3,3]=t
+        gt_ts_all.append(int(v[0])); gt_all.append(T)
+    scan_ts = np.array([int(b.stem) for b in bins], dtype=np.int64)
+    gt_ts   = np.array(gt_ts_all, dtype=np.int64)
+    gt = [gt_all[int(np.argmin(np.abs(gt_ts - ts)))] for ts in scan_ts]
+    return frames, gt
+
+
+def load_helipr(seq="DCC05", max_frames=None):
+    helipr_root = Path("/home/km/data/HeLiPR")
+    seq_dir = helipr_root / seq
+    for sub in ("Ouster", "os1", "lidar"):
+        d = seq_dir / sub
+        if d.exists():
+            bins = sorted(d.glob("*.bin"))
+            break
+    else:
+        raise FileNotFoundError(f"HeLiPR {seq}: no bin dir")
+    if max_frames: bins = bins[:max_frames]
+    frames = []
+    for b in bins:
+        raw = np.fromfile(b, dtype=np.float32).reshape(-1, 4).astype(np.float64)
+        r = np.linalg.norm(raw[:, :3], axis=1)
+        frames.append(raw[(r > 0.5) & (r < 100.0)])
+    gt_file = seq_dir / "poses.txt"
+    gt = []
+    for line in gt_file.read_text().splitlines():
+        v = list(map(float, line.split()))
+        T = np.eye(4)
+        if len(v) == 12:
+            T[:3, :] = np.array(v).reshape(3, 4)
+        elif len(v) == 8:
+            from scipy.spatial.transform import Rotation
+            T[:3, 3] = v[1:4]; T[:3, :3] = Rotation.from_quat(v[4:]).as_matrix()
+        gt.append(T)
+    n = min(len(frames), len(gt))
+    return frames[:n], gt[:n]
+
+
+LOADERS = {
+    "load_kitti": load_kitti,
+    "load_geode_tunnel": load_geode_tunnel,
+    "load_metro": load_metro,
+    "load_subt": load_subt,
+    "load_mulran": load_mulran,
+    "load_helipr": load_helipr,
+}
+
+
+# ── Worker (runs in subprocess) ────────────────────────────────────────────────
+
+def run_sequence(cfg: dict) -> dict:
+    import os
+    os.environ.setdefault("OMP_NUM_THREADS", "4")
+
+    label    = cfg["label"]
+    out_path = ROOT / "results" / "full_eval" / cfg["out_dir"] / "results.json"
+
+    # Resume from cached result
+    if out_path.exists():
         try:
-            leaves = pipeline.flat_map.leaves if pipeline.flat_map is not None else []
-            if leaves:
-                covs = np.array([
-                    getattr(v.stats, "cov", None) or getattr(v, "covariance", None)
-                    for v in leaves
-                    if (getattr(v, "stats", None) and getattr(v.stats, "cov", None) is not None)
-                    or getattr(v, "covariance", None) is not None
-                ])
-                if len(covs) > 0:
-                    # Translational Hessian proxy: sum of precision matrices (xyz block)
-                    H_trans = np.sum(np.linalg.pinv(covs[:, :3, :3] + np.eye(3) * 1e-6), axis=0)
-                    kappa = genz_icp_condition_number(
-                        np.block([[np.eye(3) * 1e-3, np.zeros((3, 3))], [np.zeros((3, 3)), H_trans]])
-                    )
-                    kappas.append(kappa)
-
-                    # Planarity ratio: fraction of voxels where λ_min/λ_max < 0.1
-                    eigvals = np.linalg.eigvalsh(covs[:, :3, :3])
-                    ratios = eigvals[:, 0] / (eigvals[:, -1] + 1e-10)
-                    planarity_ratios.append(float(np.mean(ratios < 0.1)))
+            existing = json.loads(out_path.read_text())
+            if "iv_gicp" in existing and "kiss_icp" in existing:
+                print(f"  [SKIP] {label} (cached)")
+                return existing
         except Exception:
             pass
 
-    extra = {}
-    if kappas:
-        extra["genz_kappa_mean"] = round(float(np.mean(kappas)), 2)
-        extra["genz_kappa_max"] = round(float(np.max(kappas)), 2)
-        extra["planarity_pct_mean"] = round(float(np.mean(planarity_ratios)) * 100, 1)
-        # GenZ-ICP would flag degeneracy when κ > 100
-        extra["genz_deg_frames"] = int(np.sum(np.array(kappas) > 100))
+    print(f"  [START] {label}")
+    t_wall = time.perf_counter()
 
-    return _eval(poses, poses_gt, frame_times, "GenZ-ICP (proxy)", extra)
+    loader_fn = LOADERS[cfg["loader"]]
+    frames, poses_gt = loader_fn(**cfg["loader_kw"])
+    n = len(frames)
+    print(f"  [{label}] {n} frames loaded")
 
+    # ── IV-GICP ──────────────────────────────────────────────────────────────
+    from iv_gicp.pipeline import IVGICPPipeline
+    iv_params = dict(cfg["iv_params"])  # copy to avoid mutating original
+    iv_params.setdefault("device", "cpu")
+    pipeline = IVGICPPipeline(**iv_params)
+    iv_times = []
+    for i, f in enumerate(frames):
+        pts = np.asarray(f, dtype=np.float64)
+        xyz = pts[:, :3]
+        itn = pts[:, 3] if pts.shape[1] >= 4 else np.zeros(len(pts))
+        t0 = time.perf_counter()
+        pipeline.process_frame(xyz, itn, timestamp=float(i))
+        iv_times.append((time.perf_counter() - t0) * 1000)
+        if (i + 1) % 500 == 0:
+            print(f"  [{label}] IV {i+1}/{n} ...", end="\r", flush=True)
+    iv_poses = [p.copy() for p in pipeline.get_trajectory().poses]
+    iv_ate   = ate_rmse(iv_poses, poses_gt)
+    iv_rpe   = rpe_rmse(iv_poses, poses_gt)
+    iv_ms    = float(np.mean(iv_times[1:])) if len(iv_times) > 1 else 0.0
+    print(f"  [{label}] IV-GICP  ATE={iv_ate:.4f}m  {iv_ms:.0f}ms/fr       ")
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Write eval.md
-# ──────────────────────────────────────────────────────────────────────────────
-def write_eval_md(ablation, comparison, args, n_frames, out_path):
-    from datetime import date
+    # ── KISS-ICP ─────────────────────────────────────────────────────────────
+    from kiss_icp.kiss_icp import KissICP
+    from kiss_icp.config import KISSConfig
+    kp = cfg["kiss_params"]
+    kcfg = KISSConfig()
+    kcfg.data.deskew  = False
+    kcfg.data.max_range  = kp.get("max_range", 80.0)
+    kcfg.data.min_range  = kp.get("min_range", 0.5)
+    kcfg.mapping.voxel_size = kp.get("voxel_size", 1.0)
+    kiss = KissICP(config=kcfg)
+    kiss_poses, kiss_times = [], []
+    for i, f in enumerate(frames):
+        pts = np.asarray(f[:, :3], dtype=np.float64)
+        pts = pts[np.isfinite(pts).all(axis=1)]
+        t0 = time.perf_counter()
+        kiss.register_frame(pts, np.full(len(pts), float(i)))
+        kiss_times.append((time.perf_counter() - t0) * 1000)
+        kiss_poses.append(kiss.last_pose.copy())
+    kiss_ate = ate_rmse(kiss_poses, poses_gt)
+    kiss_rpe = rpe_rmse(kiss_poses, poses_gt)
+    kiss_ms  = float(np.mean(kiss_times)) if kiss_times else 0.0
+    print(f"  [{label}] KISS-ICP ATE={kiss_ate:.4f}m  {kiss_ms:.0f}ms/fr")
 
-    today = date.today().isoformat()
+    winner = "IV-GICP" if iv_ate < kiss_ate else "KISS-ICP"
+    pct = (kiss_ate - iv_ate) / kiss_ate * 100
 
-    L = []
-
-    L += [
-        "# IV-GICP Evaluation Report\n",
-        f"**Date:** {today}  ",
-        f"**Dataset:** KITTI Raw (`{args.data}`, {n_frames} frames)  ",
-        f"**Device:** {args.device}  ",
-        f"**Downsample:** {args.downsample} pts/beam  \n",
-        "> 10-20 프레임 기준 결과 (경향성 확인 용도). "
-        "KITTI 공식 t-err%는 시퀀스가 짧아 의미 있는 값이 나오지 않음.  \n",
-        "---\n",
-    ]
-
-    # ── Ablation ──────────────────────────────────────────────────────────────
-    L += [
-        "## Ablation Study (IV-GICP Components)\n",
-        "> 각 컴포넌트의 기여도 분리 실험. GPU 가속 적용.\n",
-        "| Config | Adaptive | Intensity (4D) | Dist.Prop. | ATE RMSE (m) ↓ | RPE RMSE (m) ↓ | ms/frame |",
-        "|--------|:---:|:---:|:---:|---:|---:|---:|",
-    ]
-
-    flags = [
-        (False, False, False),
-        (True, False, False),
-        (False, True, False),
-        (True, True, False),
-        (True, True, True),
-    ]
-    for m, (ada, inten, dp) in zip(ablation, flags):
-        ate = f"{m['ate_rmse']:.4f}" if "ate_rmse" in m else "N/A"
-        rpe = f"{m['rpe_rmse']:.4f}" if "rpe_rmse" in m else "N/A"
-        bold = "**" if (ada and inten) else ""
-        L.append(
-            f"| {bold}{m['label']}{bold} "
-            f"| {'✓' if ada else '✗'} | {'✓' if inten else '✗'} | {'✓' if dp else '✗'} "
-            f"| {bold}{ate}{bold} | {bold}{rpe}{bold} | {m['avg_frame_ms']:.0f} |"
-        )
-
-    # Observations
-    ate_A = ablation[0].get("ate_rmse", float("nan"))
-    ate_D = ablation[3].get("ate_rmse", float("nan"))
-    speedup_note = ""
-    if args.device in ("cuda", "auto"):
-        speedup_note = " GPU 가속으로 이전 CPU 대비 **~33× 빠름**."
-
-    L += [
-        "\n### 관찰\n",
-        f"- **B (Adaptive only):** Intensity 없이 adaptive만 쓰면 correspondence 부족으로 오히려 정확도 저하 가능."
-        f" Intensity covariance와 함께 사용해야 효과적.",
-        f"- **C (Intensity only):** 기하 퇴화 없는 시퀀스에서 baseline과 유사. 터널/복도에서 차이 예상.",
-        f"- **D ≈ E:** Distribution Propagation은 정합 정확도 영향 없이 맵 갱신 비용만 감소.",
-        f"- **D/E vs A:** ATE `{ate_A:.4f}` → `{ate_D:.4f}` m (`{ate_A/max(ate_D,1e-6):.1f}×` 향상).{speedup_note}",
-        "\n---\n",
-    ]
-
-    # ── Method comparison ──────────────────────────────────────────────────────
-    L += [
-        "## Method Comparison\n",
-        "| Method | Intensity | Adaptive | ATE RMSE (m) ↓ | RPE RMSE (m) ↓ | ms/frame |",
-        "|--------|:---:|:---:|---:|---:|---:|",
-    ]
-
-    method_flags = {
-        "GICP Baseline": ("✗", "✗"),
-        "IV-GICP (Full)": ("✓", "✓"),
-        "KISS-ICP": ("✗", "✓ (adaptive thresh.)"),
-        "GenZ-ICP (proxy)": ("✗", "✓ (entropy-based)"),
+    result = {
+        "label": label, "domain": cfg["domain"], "n_frames": n,
+        "wall_time_s": round(time.perf_counter() - t_wall, 1),
+        "iv_gicp":  {"ate_m": round(iv_ate, 4), "rpe_m": round(iv_rpe, 4),
+                     "ms_per_frame": round(iv_ms, 1)},
+        "kiss_icp": {"ate_m": round(kiss_ate, 4), "rpe_m": round(kiss_rpe, 4),
+                     "ms_per_frame": round(kiss_ms, 1)},
+        "winner": winner,
+        "iv_improvement_pct": round(pct, 1),
+        "iv_params": cfg["iv_params"],
     }
-    for m in comparison:
-        lbl = m["label"]
-        inten, ada = method_flags.get(lbl, ("?", "?"))
-        ate = f"{m['ate_rmse']:.4f}" if "ate_rmse" in m else "N/A"
-        rpe = f"{m['rpe_rmse']:.4f}" if "rpe_rmse" in m else "N/A"
-        L.append(f"| **{lbl}** | {inten} | {ada} " f"| {ate} | {rpe} | {m['avg_frame_ms']:.0f} |")
-
-    # GenZ proxy extra info
-    genz = next((m for m in comparison if "GenZ" in m["label"]), None)
-    if genz and "genz_kappa_mean" in genz:
-        L += [
-            "\n### GenZ-ICP proxy: 퇴화 메트릭\n",
-            f"| κ 평균 | κ 최대 | 퇴화 감지 프레임 (κ>100) | 평균 planarity % |",
-            f"|--------|--------|--------------------------|-----------------|",
-            f"| {genz['genz_kappa_mean']} | {genz['genz_kappa_max']} "
-            f"| {genz.get('genz_deg_frames', 0)} / {n_frames} "
-            f"| {genz.get('planarity_pct_mean', 'N/A')} % |",
-            "\n> **Note:** Official GenZ-ICP (Lee et al., RA-L 2025) is C++/ROS2 only "
-            "(https://github.com/cocel-postech/genz-icp). This proxy replicates the "
-            "geometry-only + adaptive-weighting idea in Python. "
-            "κ = √(λ_max/λ_min) of translational Hessian block.",
-        ]
-
-    # Speed analysis
-    kiss_ms = next((m["avg_frame_ms"] for m in comparison if "KISS" in m["label"]), None)
-    iv_ms = next((m["avg_frame_ms"] for m in comparison if m["label"] == "IV-GICP (Full)"), None)
-    if kiss_ms and iv_ms:
-        ratio = iv_ms / kiss_ms
-        L += [
-            "\n### 속도 분석\n",
-            f"| 방법 | ms/frame | 참고 |",
-            f"|------|----------|------|",
-        ]
-        for m in comparison:
-            note = ""
-            if "KISS" in m["label"]:
-                note = "C++ backend"
-            elif "IV-GICP" in m["label"]:
-                note = f"Python + GPU, {ratio:.0f}× slower than KISS-ICP"
-            elif "GenZ" in m["label"]:
-                note = "Python proxy"
-            L.append(f"| {m['label']} | {m['avg_frame_ms']:.0f} | {note} |")
-
-        L += [
-            f"\n- **IV-GICP vs KISS-ICP 속도:** IV-GICP ({iv_ms:.0f} ms) = "
-            f"KISS-ICP ({kiss_ms:.0f} ms) × {ratio:.0f}. 구현 언어(Python vs C++) 차이가 주요 원인.",
-            "- GPU 가속으로 이전 CPU 11,715 ms → 현재 ~356 ms (32.9×). " "C++ 이식 시 KISS-ICP 수준 달성 가능.",
-        ]
-
-    # ── Distribution Propagation benchmark ────────────────────────────────────
-    L += [
-        "\n---\n",
-        "## Map Refinement: FORM vs Distribution Propagation\n",
-        "> `examples/run_form_benchmark.py` 결과 (Python 구현 기준)\n",
-        "| 방법 | 대상 | 소요 시간 | 복잡도 |",
-        "|------|------|----------|--------|",
-        "| FORM (point-wise) | 점 100,000개 변환 | 10.94 ms | O(n) |",
-        "| **Distribution Propagation** | **복셀 35,560개 (μ, Σ) 업데이트** | **83.72 ms** | **O(k)** |",
-        "\n> Python 레벨에서 3×3 행렬 연산(R Σ R^T)이 행렬-벡터(T·p)보다 느림.",
-        "> C++/Eigen 구현 시 이론적 O(k) 이점이 발현되어 ~110× 우위 예상.",
-        "\n---\n",
-    ]
-
-    # ── Experimental setup ─────────────────────────────────────────────────────
-    L += [
-        "## 실험 설정\n",
-        "```",
-        f"Dataset:    KITTI Raw (data/kitti/sample)",
-        f"Frames:     {n_frames}",
-        f"Downsample: {args.downsample} pts/beam",
-        f"Device:     {args.device} (IV-GICP)",
-        "Voxel size: 1.0 m",
-        "Max range:  80 m / Min range: 2 m",
-        "Max pts/map: 200,000",
-        "",
-        "IV-GICP Full params:",
-        "  alpha:                    0.1",
-        "  entropy_threshold:        0.5",
-        "  intensity_var_threshold:  0.01",
-        "  use_distribution_propagation: True",
-        "",
-        "KISS-ICP: voxel_size=1.0, max_range=80, deskew=False",
-        "GenZ-ICP proxy: alpha=0, entropy_threshold=0.5, geometry-only",
-        "```",
-        "\n---\n",
-        "## 한계 및 향후 작업\n",
-        "1. **속도:** Python + GPU 구현. KISS-ICP(C++) 대비 느림. C++ 이식으로 해소 가능.",
-        "2. **GenZ-ICP 공식 비교:** 공식 구현(C++/ROS2) 미설치. 논문 reported 수치와 비교 필요.",
-        "3. **짧은 시퀀스:** 10-20 프레임으로 KITTI 공식 t-err% 계산 불가. 전체 시퀀스 필요.",
-        "4. **터널/복도 데이터셋:** Intensity degeneracy 억제 효과 확인 위한 별도 데이터셋 필요.",
-    ]
 
     out_path.parent.mkdir(parents=True, exist_ok=True)
-    out_path.write_text("\n".join(L) + "\n")
-    print(f"\nSaved: {out_path}")
+    out_path.write_text(json.dumps(result, indent=2))
+    print(f"  [SAVED] {label}  →  {out_path.relative_to(ROOT)}")
+    return result
 
 
-# ──────────────────────────────────────────────────────────────────────────────
+# ── Summary ────────────────────────────────────────────────────────────────────
+
+def write_summary(results: list, out_root: Path):
+    wins = sum(1 for r in results if r.get("winner") == "IV-GICP")
+    summary = {"n_sequences": len(results), "n_iv_wins": wins,
+               "win_rate_pct": round(wins / len(results) * 100, 1) if results else 0,
+               "sequences": results}
+    (out_root / "summary.json").write_text(json.dumps(summary, indent=2))
+
+    lines = [
+        "# IV-GICP vs KISS-ICP — Full Sequence Evaluation",
+        "",
+        f"**{wins}/{len(results)} sequences: IV-GICP wins ({wins/len(results)*100:.0f}%)**",
+        "",
+        "| Dataset | Frames | IV-ATE (m) | KISS-ATE (m) | Δ% | IV-RPE | KISS-RPE | ms/fr IV | ms/fr KISS | Winner |",
+        "|---------|--------|-----------|-------------|-----|--------|---------|---------|-----------|--------|",
+    ]
+    for r in sorted(results, key=lambda x: x.get("domain","") + x.get("label","")):
+        iv = r["iv_gicp"]; ki = r["kiss_icp"]; pct = r["iv_improvement_pct"]
+        win = "**IV-GICP**" if r["winner"] == "IV-GICP" else "KISS-ICP"
+        lines.append(
+            f"| {r['label']} | {r['n_frames']} "
+            f"| {iv['ate_m']:.4f} | {ki['ate_m']:.4f} | {pct:+.1f}% "
+            f"| {iv['rpe_m']:.4f} | {ki['rpe_m']:.4f} "
+            f"| {iv['ms_per_frame']:.0f} | {ki['ms_per_frame']:.0f} | {win} |"
+        )
+    (out_root / "summary.md").write_text("\n".join(lines) + "\n")
+
+
+# ── Main ──────────────────────────────────────────────────────────────────────
+
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--data", default="data/kitti/sample")
-    parser.add_argument("--max-frames", type=int, default=15)
-    parser.add_argument("--downsample", type=int, default=5)
-    parser.add_argument("--device", default="auto")
-    parser.add_argument("-o", "--output", default="docs/eval.md")
+    parser.add_argument("--workers", type=int, default=6,
+                        help="Parallel workers (default 6; each uses OMP_NUM_THREADS=4)")
+    parser.add_argument("--dataset", default=None,
+                        choices=["kitti","geode_urban","metro","subt","mulran","helipr"],
+                        help="Filter by domain")
+    parser.add_argument("--seq",  default=None, help="Filter by label substring")
+    parser.add_argument("--no-parallel", action="store_true")
+    parser.add_argument("--no-skip", action="store_true", help="Rerun even if cached")
     args = parser.parse_args()
 
-    data_path = Path(args.data)
-    if not data_path.exists():
-        print(f"Error: {data_path} not found")
-        sys.exit(1)
+    seqs = build_sequences()
+    if args.dataset: seqs = [s for s in seqs if s["domain"] == args.dataset]
+    if args.seq:     seqs = [s for s in seqs if args.seq.lower() in s["label"].lower()]
+    if not seqs:
+        print("No sequences found. Check paths or --dataset/--seq filter."); return
 
-    print(f"Loading KITTI: {data_path} ({args.max_frames} frames, ds={args.downsample})")
-    frames_xyzI, poses_gt = load_kitti_sequence(str(data_path), args.max_frames, downsample=args.downsample)
-    frames_xyz = [f[:, :3] for f in frames_xyzI]
-    n = len(frames_xyzI)
-    print(f"  {n} frames, ~{len(frames_xyzI[0])} pts/frame\n")
+    out_root = ROOT / "results" / "full_eval"
+    out_root.mkdir(parents=True, exist_ok=True)
 
-    common = dict(
-        voxel_size=1.0,
-        max_correspondence_distance=5.0,
-        max_range=80.0,
-        min_range=2.0,
-        source_voxel_size=0.3,
-        max_map_points=200_000,
-    )
+    print(f"\nIV-GICP Full Evaluation")
+    print(f"  Sequences : {len(seqs)}")
+    print(f"  Workers   : {1 if args.no_parallel else args.workers}")
+    print(f"  Output    : {out_root}\n")
 
-    # ── Ablation (all on same device) ─────────────────────────────────────────
-    print("=" * 60)
-    print("ABLATION STUDY")
-    print("=" * 60)
+    results = []
 
-    ablation_configs = [
-        (
-            "GICP Baseline",
-            dict(alpha=0.0, entropy_threshold=1e10, intensity_var_threshold=1e10, use_distribution_propagation=False),
-        ),
-        (
-            "+ Adaptive only",
-            dict(alpha=0.0, entropy_threshold=0.5, intensity_var_threshold=100.0, use_distribution_propagation=False),
-        ),
-        (
-            "+ Intensity only",
-            dict(alpha=0.1, entropy_threshold=1e10, intensity_var_threshold=1e10, use_distribution_propagation=False),
-        ),
-        (
-            "IV-GICP (no DP)",
-            dict(alpha=0.1, entropy_threshold=0.5, intensity_var_threshold=0.01, use_distribution_propagation=False),
-        ),
-        (
-            "IV-GICP (Full)",
-            dict(alpha=0.1, entropy_threshold=0.5, intensity_var_threshold=0.01, use_distribution_propagation=True),
-        ),
-    ]
+    if args.no_parallel or args.workers == 1:
+        for cfg in seqs:
+            results.append(run_sequence(cfg))
+    else:
+        # Subprocess-based parallelism: each sequence runs as independent uv process
+        # This avoids C++ extension (OpenMP) conflicts in forked/spawned workers.
+        def _run_subprocess(cfg):
+            label = cfg["label"]
+            out_path = ROOT / "results" / "full_eval" / cfg["out_dir"] / "results.json"
+            if not args.no_skip and out_path.exists():
+                try:
+                    existing = json.loads(out_path.read_text())
+                    if "iv_gicp" in existing and "kiss_icp" in existing:
+                        print(f"  [SKIP] {label}")
+                        return existing
+                except Exception:
+                    pass
+            env = {**__import__("os").environ, "OMP_NUM_THREADS": "4"}
+            cmd = [
+                "uv", "run", "python", str(ROOT / "examples" / "run_full_eval.py"),
+                "--seq", label, "--no-parallel",
+            ]
+            proc = subprocess.run(cmd, capture_output=True, text=True, env=env, cwd=str(ROOT))
+            if proc.returncode != 0:
+                print(f"  ERROR {label}:\n{proc.stderr[-500:]}")
+                return {"label": label, "domain": cfg["domain"], "error": proc.stderr[-200:]}
+            if out_path.exists():
+                return json.loads(out_path.read_text())
+            return {"label": label, "domain": cfg["domain"], "error": "no output file"}
 
-    ablation = []
-    for label, cfg in ablation_configs:
-        print(f"\n[{len(ablation)+1}/5] {label}")
-        r = run_iv_gicp(frames_xyzI, poses_gt, label, device=args.device, **common, **cfg)
-        ablation.append(r)
-        print(f"  ATE: {r.get('ate_rmse','N/A')} m  RPE: {r.get('rpe_rmse','N/A')} m  {r['avg_frame_ms']:.0f} ms/frame")
+        with ThreadPoolExecutor(max_workers=args.workers) as ex:
+            futs = {ex.submit(_run_subprocess, cfg): cfg["label"] for cfg in seqs}
+            for fut in as_completed(futs):
+                label = futs[fut]
+                try:
+                    r = fut.result()
+                    if "error" not in r:
+                        results.append(r)
+                        iv = r["iv_gicp"]["ate_m"]; ki = r["kiss_icp"]["ate_m"]
+                        win = "IV-GICP ✓" if iv < ki else "KISS-ICP"
+                        print(f"  DONE  {label:<48}  IV={iv:.4f}  KISS={ki:.4f}  {win}")
+                    else:
+                        print(f"  ERROR {label}: {r.get('error','')}")
+                except Exception as e:
+                    print(f"  ERROR {label}: {e}")
 
-    # ── Method comparison ──────────────────────────────────────────────────────
-    print("\n" + "=" * 60)
-    print("METHOD COMPARISON")
-    print("=" * 60)
+    results.sort(key=lambda x: x.get("label", ""))
+    write_summary(results, out_root)
 
-    comparison = []
-
-    # GICP baseline (already in ablation[0])
-    comparison.append(ablation[0])
-
-    # IV-GICP Full (ablation[4])
-    comparison.append(ablation[4])
-
-    print(f"\n[3/4] KISS-ICP")
-    r = run_kiss_icp(frames_xyz, poses_gt)
-    comparison.append(r)
-    print(f"  ATE: {r.get('ate_rmse','N/A')} m  RPE: {r.get('rpe_rmse','N/A')} m  {r['avg_frame_ms']:.0f} ms/frame")
-
-    print(f"\n[4/4] GenZ-ICP (proxy)")
-    r = run_genz_proxy(frames_xyzI, poses_gt, device=args.device)
-    comparison.append(r)
-    print(f"  ATE: {r.get('ate_rmse','N/A')} m  RPE: {r.get('rpe_rmse','N/A')} m  {r['avg_frame_ms']:.0f} ms/frame")
-    if "genz_kappa_mean" in r:
-        print(
-            f"  κ mean={r['genz_kappa_mean']}, max={r['genz_kappa_max']}, "
-            f"planarity={r.get('planarity_pct_mean','?')}%"
-        )
-
-    # ── Summary ───────────────────────────────────────────────────────────────
-    print(f"\n{'='*70}")
-    print(f"{'Method':<30} {'ATE(m)':>8} {'RPE(m)':>8} {'ms/fr':>7}")
-    print("-" * 70)
-    for r in ablation + [c for c in comparison if c not in ablation]:
-        ate = f"{r.get('ate_rmse',float('nan')):.4f}"
-        rpe = f"{r.get('rpe_rmse',float('nan')):.4f}"
-        ms = f"{r['avg_frame_ms']:.0f}"
-        print(f"{r['label']:<30} {ate:>8} {rpe:>8} {ms:>7}")
-
-    write_eval_md(ablation, comparison, args, n, Path(args.output))
+    wins = sum(1 for r in results if r.get("winner") == "IV-GICP")
+    print(f"\n{'='*95}")
+    print(f"  {'Dataset':<48} {'Frames':>7}  {'IV-ATE':>8}  {'KISS-ATE':>8}  {'Δ%':>7}  Winner")
+    print(f"  {'-'*93}")
+    for r in results:
+        iv_ate = r["iv_gicp"]["ate_m"]; ki_ate = r["kiss_icp"]["ate_m"]
+        pct = r["iv_improvement_pct"]
+        win = "IV-GICP" if r["winner"] == "IV-GICP" else "KISS-ICP"
+        print(f"  {r['label']:<48} {r['n_frames']:>7}  {iv_ate:>8.4f}  {ki_ate:>8.4f}  {pct:>+7.1f}%  {win}")
+    print(f"  {'─'*93}")
+    print(f"  IV-GICP wins: {wins}/{len(results)} ({wins/len(results)*100:.0f}%)")
+    print(f"{'='*95}\n")
+    print(f"  results/full_eval/summary.md")
+    print(f"  results/full_eval/summary.json\n")
 
 
 if __name__ == "__main__":

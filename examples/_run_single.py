@@ -4,7 +4,7 @@ Internal helper: run a single method and print JSON result.
 Called by run_full_eval.py via subprocess for process isolation.
 
 Usage:
-  python examples/_run_single.py --method gicp_baseline --frames 15 --device cuda
+  python examples/_run_single.py --method adaptive_only --frames 15 --device cuda
 """
 import argparse, json, sys, time
 from pathlib import Path
@@ -51,6 +51,7 @@ def run_kiss(frames_xyz, gt):
     cfg = KISSConfig()
     cfg.data.max_range = 80.0
     cfg.data.min_range = 2.0
+    cfg.data.deskew = False  # 타임스탬프 0 전달 시 deskew=True면 C++ preprocess에서 abort
     cfg.mapping.voxel_size = 1.0
     kiss = KissICP(config=cfg)
     poses, ts = [], []
@@ -69,7 +70,7 @@ def run_genz_proxy(frames, gt, device):
 
     p = IVGICPPipeline(
         device=device, alpha=0.0, entropy_threshold=0.5,
-        intensity_var_threshold=1e10, use_distribution_propagation=False,
+        intensity_var_threshold=1e10,
         voxel_size=1.0, max_correspondence_distance=5.0,
         max_range=80.0, min_range=2.0, source_voxel_size=0.3, max_map_points=200_000,
     )
@@ -113,21 +114,14 @@ COMMON = dict(
     max_range=80.0, min_range=2.0, source_voxel_size=0.3, max_map_points=200_000,
 )
 METHODS = {
-    "gicp_baseline":  lambda f, g, d: run_iv_gicp(f, g, "GICP Baseline", d,
-        alpha=0.0, entropy_threshold=1e10, intensity_var_threshold=1e10,
-        use_distribution_propagation=False, **COMMON),
     "adaptive_only":  lambda f, g, d: run_iv_gicp(f, g, "+ Adaptive only", d,
-        alpha=0.0, entropy_threshold=0.5, intensity_var_threshold=100.,
-        use_distribution_propagation=False, **COMMON),
+        alpha=0.0, entropy_threshold=0.5, intensity_var_threshold=100., **COMMON),
     "intensity_only": lambda f, g, d: run_iv_gicp(f, g, "+ Intensity only", d,
-        alpha=0.1, entropy_threshold=1e10, intensity_var_threshold=1e10,
-        use_distribution_propagation=False, **COMMON),
+        alpha=0.1, entropy_threshold=1e10, intensity_var_threshold=1e10, **COMMON),
     "iv_gicp_no_dp":  lambda f, g, d: run_iv_gicp(f, g, "IV-GICP (no DP)", d,
-        alpha=0.1, entropy_threshold=0.5, intensity_var_threshold=0.01,
-        use_distribution_propagation=False, **COMMON),
+        alpha=0.1, entropy_threshold=0.5, intensity_var_threshold=0.01, **COMMON),
     "iv_gicp_full":   lambda f, g, d: run_iv_gicp(f, g, "IV-GICP (Full)", d,
-        alpha=0.1, entropy_threshold=0.5, intensity_var_threshold=0.01,
-        use_distribution_propagation=True, **COMMON),
+        alpha=0.1, entropy_threshold=0.5, intensity_var_threshold=0.01, **COMMON),
     "kiss_icp":       lambda f, g, d: run_kiss([x[:, :3] for x in f], g),
     "genz_proxy":     lambda f, g, d: run_genz_proxy(f, g, d),
 }
@@ -139,7 +133,7 @@ def main():
     pa.add_argument("--data",       default="data/kitti/sample")
     pa.add_argument("--frames",     type=int, default=15)
     pa.add_argument("--downsample", type=int, default=5)
-    pa.add_argument("--device",     default="auto")
+    pa.add_argument("--device",     default="cpu")
     args = pa.parse_args()
 
     frames, gt = load_kitti_sequence(args.data, args.frames, downsample=args.downsample)

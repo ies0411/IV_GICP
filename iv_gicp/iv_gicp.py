@@ -21,22 +21,9 @@ from dataclasses import dataclass, field
 
 from iv_gicp.fast_kdtree import FastKDTree
 from iv_gicp.se3_utils import se3_exp, transform_point
-from iv_gicp.gpu_backend import (
-    get_device,
-    batch_intensity_gradients,
-    batch_precision_matrices,
-    gn_hessian_gradient,
-    TargetGPUCache,
-)
+from iv_gicp.gpu_backend import get_device, batch_intensity_gradients, batch_precision_matrices
 
-# C++ core: full GN loop in Eigen (no Python/CUDA overhead per iteration)
-try:
-    from iv_gicp.cpp import iv_gicp_core as _cpp_core
-
-    _CPP_CORE_AVAILABLE = True
-except ImportError:
-    _cpp_core = None
-    _CPP_CORE_AVAILABLE = False
+from iv_gicp.cpp import iv_gicp_core as _cpp_core
 
 
 # ─── Data structures ──────────────────────────────────────────────────────────
@@ -146,16 +133,20 @@ class IVGICP:
         self,
         alpha: float = 0.1,  # intensity scaling (unit alignment: ~range/max_I)
         max_correspondence_distance: float = 2.0,
-        max_iterations: int = 100,
+        max_iterations: int = 12,
         convergence_threshold: float = 1e-4,
         min_voxel_size: float = 0.5,  # ℓ_v for σ_I² formula
         n_intensity_grad_neighbors: int = 8,  # K for gradient estimation
         huber_delta: float = 0.0,  # Huber threshold (0 = disabled)
         source_sigma: float = 0.0,  # source point uncertainty [m]; 0 = target-only Omega
-        device: str = "auto",  # 'auto'|'cuda'|'cpu'|None
+        device: str = "cpu",  # 'cpu' (default, C++ 빠름) | 'cuda' | 'auto'
         use_fim_weight: bool = False,  # C1: weight by FIM contribution v^T H_i v (Python path only)
         use_degeneracy_aware_intensity_weight: bool = False,  # A.2: upweight intensity for correspondences that inform degenerate direction v
         degeneracy_kappa_threshold: float = 10.0,  # when κ_geo >= this, apply degeneracy-aware intensity weighting
+        max_source_points: int = 2048,  # C++ GN: uniform subsample (0 = all; slower)
+        gm_scale: float = 0.0,       # [I2] Geman-McClure kernel scale c; w=c²/(c²+r²); 0=disabled (use Huber or none)
+        fim_gate_ratio: float = 0.0, # [I3] FIM hard gate: drop correspondences with FIM < ratio×mean; 0=disabled
+        icp_trim_ratio: float = 0.0, # [C4] Trimmed GICP: drop top trim_ratio fraction by Mahal residual; 0=disabled
     ):
         self.alpha = alpha
         self.max_corr_dist = max_correspondence_distance
@@ -168,8 +159,11 @@ class IVGICP:
         self.use_fim_weight = use_fim_weight
         self.use_degeneracy_aware_intensity_weight = use_degeneracy_aware_intensity_weight
         self.degeneracy_kappa_threshold = degeneracy_kappa_threshold
+        self.max_source_points = max_source_points
+        self.gm_scale = gm_scale
+        self.fim_gate_ratio = fim_gate_ratio
+        self.icp_trim_ratio = icp_trim_ratio
         self._device = get_device(device)
-        self._gpu_cache = TargetGPUCache(self._device)
 
     def _compute_intensity_gradients(
         self,
@@ -311,33 +305,100 @@ class IVGICP:
         target_arrays: dict,
         init_pose: Optional[np.ndarray] = None,
         max_corr_dist: Optional[float] = None,
+        session=None,
+        use_mscs: bool = False,
+        mscs_kappa_max: float = 100.0,
+        v_min_prev: Optional[np.ndarray] = None,
     ) -> Tuple[np.ndarray, dict]:
         """
         Register source to pre-built target arrays (C++ fast path).
         Bypasses Voxel4D extraction — arrays come directly from VoxelMap.build_target_arrays.
+        If session is provided (C++ RegistrationSession), reuses cached KDTree for speed.
         """
         target_means_4d = np.ascontiguousarray(target_arrays["means_4d"], dtype=np.float64)
         target_precisions = np.ascontiguousarray(target_arrays["prec"], dtype=np.float64)
         target_grads = np.ascontiguousarray(target_arrays["grads"], dtype=np.float64)
         means_3d = np.ascontiguousarray(target_arrays["means_3d"], dtype=np.float64)
-        self._gpu_cache.load(target_means_4d, target_precisions, target_grads)
 
         T = np.eye(4) if init_pose is None else np.array(init_pose, dtype=float)
-        # Build tree from means_3d for the Python GN fallback path.
-        # The C++ GN path (iv_gicp_core) builds its own tree internally.
-        tree = FastKDTree(means_3d)
-        T, info = self._gauss_newton_vectorized(
-            src_xyz[:, :3],
-            src_intensities,
-            means_3d,
+        corr_dist = max_corr_dist if max_corr_dist is not None else self.max_corr_dist
+        n_target = len(target_means_4d)
+        info = {"iterations": 0, "n_correspondences": 0, "converged": False}
+
+        v_prev = np.zeros(6, dtype=np.float64)
+        if v_min_prev is not None:
+            v_prev = np.ascontiguousarray(v_min_prev, dtype=np.float64)
+
+        # C++ path with session: reuse cached KDTree (no tree build)
+        if session is not None:
+            result = session.register(
+                np.ascontiguousarray(src_xyz, dtype=np.float64),
+                np.ascontiguousarray(src_intensities, dtype=np.float64),
+                target_means_4d,
+                np.ascontiguousarray(target_precisions.reshape(n_target, 4, 4), dtype=np.float64),
+                target_grads,
+                np.ascontiguousarray(T, dtype=np.float64),
+                float(corr_dist),
+                float(self.alpha),
+                int(self.max_iter),
+                float(self.huber_delta),
+                6,
+                bool(self.use_fim_weight),
+                int(self.max_source_points),
+                float(self.gm_scale),
+                float(self.fim_gate_ratio),
+                float(self.icp_trim_ratio),
+                bool(use_mscs),
+                float(mscs_kappa_max),
+                v_prev,
+            )
+            info["iterations"] = result["iterations"]
+            info["n_correspondences"] = result["n_valid"]
+            info["converged"] = result["converged"]
+            if result["n_valid"] >= 6:
+                info["hessian"] = result["H"]
+            info["v_min"] = np.asarray(result["v_min"], dtype=np.float64)
+            info["n_mscs_used"] = int(result["n_mscs_used"])
+            if "tree_build_ms" in result:
+                info["tree_build_ms"] = float(result["tree_build_ms"])
+            if "gn_loop_ms" in result:
+                info["gn_loop_ms"] = float(result["gn_loop_ms"])
+            return result["T"], info
+
+        result = _cpp_core.icp_register(
+            np.ascontiguousarray(src_xyz, dtype=np.float64),
+            np.ascontiguousarray(src_intensities, dtype=np.float64),
             target_means_4d,
-            target_precisions,
+            np.ascontiguousarray(target_precisions.reshape(n_target, 4, 4), dtype=np.float64),
             target_grads,
-            tree,
-            T,
-            max_corr_dist=max_corr_dist,
+            means_3d,
+            np.ascontiguousarray(T, dtype=np.float64),
+            float(corr_dist),
+            float(self.alpha),
+            int(self.max_iter),
+            float(self.huber_delta),
+            6,
+            bool(self.use_fim_weight),
+            int(self.max_source_points),
+            float(self.gm_scale),
+            float(self.fim_gate_ratio),
+            float(self.icp_trim_ratio),
+            bool(use_mscs),
+            float(mscs_kappa_max),
+            v_prev,
         )
-        return T, info
+        info["iterations"] = result["iterations"]
+        info["n_correspondences"] = result["n_valid"]
+        info["converged"] = result["converged"]
+        if result["n_valid"] >= 6:
+            info["hessian"] = result["H"]
+        info["v_min"] = np.asarray(result["v_min"], dtype=np.float64)
+        info["n_mscs_used"] = int(result["n_mscs_used"])
+        if "tree_build_ms" in result:
+            info["tree_build_ms"] = float(result["tree_build_ms"])
+        if "gn_loop_ms" in result:
+            info["gn_loop_ms"] = float(result["gn_loop_ms"])
+        return result["T"], info
 
     def _precompute_target_arrays(
         self,
@@ -355,8 +416,6 @@ class IVGICP:
         target_means_4d = np.array([v.mean for v in voxels_t])  # (M, 4)
         target_precisions = np.array([v.precision for v in voxels_t])  # (M, 4, 4)
         target_grads = np.array([v.intensity_gradient for v in voxels_t])  # (M, 3)
-        # Pre-transfer to GPU once (reused for all GN iterations in this call)
-        self._gpu_cache.load(target_means_4d, target_precisions, target_grads)
         return target_means_4d, target_precisions, target_grads
 
     def _gauss_newton_vectorized(
@@ -371,215 +430,40 @@ class IVGICP:
         T: np.ndarray,
         max_corr_dist: Optional[float] = None,
     ) -> Tuple[np.ndarray, dict]:
-        """
-        Vectorized Gauss-Newton optimization for geo-photometric registration.
-
-        All per-point operations (residuals, Jacobians, Hessian accumulation) are
-        batched via NumPy einsum, eliminating the Python per-point loop.
-
-        Complexity per iteration: O(M) where M = valid correspondences,
-        with NumPy-level vectorization (no Python loop over points).
-
-        Args:
-            src_xyz: (N, 3) source point coordinates
-            src_intensities: (N,) source intensity values
-            means_t: (M, 3) target voxel centers (for KDTree)
-            target_means_4d: (M, 4) target voxel means [x,y,z,αI]
-            target_precisions: (M, 4, 4) precomputed C^{-1}
-            target_grads: (M, 3) intensity gradients
-            tree_t: KDTree for nearest-voxel queries
-            T: (4, 4) initial pose estimate
-
-        Returns:
-            T: (4, 4) optimized pose
-            info: dict with convergence diagnostics
-        """
+        """C++ iv_gicp_core.icp_register only."""
         corr_dist = max_corr_dist if max_corr_dist is not None else self.max_corr_dist
         n_target = len(target_means_4d)
         info = {"iterations": 0, "n_correspondences": 0, "converged": False}
-        H = None  # Hessian from last GN iteration (None if no correspondences found)
+        result = _cpp_core.icp_register(
+            np.ascontiguousarray(src_xyz, dtype=np.float64),
+            np.ascontiguousarray(src_intensities, dtype=np.float64),
+            np.ascontiguousarray(target_means_4d, dtype=np.float64),
+            np.ascontiguousarray(target_precisions.reshape(n_target, 4, 4), dtype=np.float64),
+            np.ascontiguousarray(target_grads, dtype=np.float64),
+            np.ascontiguousarray(means_t, dtype=np.float64),
+            np.ascontiguousarray(T, dtype=np.float64),
+            float(corr_dist),
+            float(self.alpha),
+            int(self.max_iter),
+            float(self.huber_delta),
+            6,
+            bool(self.use_fim_weight),
+            int(self.max_source_points),
+            float(self.gm_scale),
+            float(self.fim_gate_ratio),
+            float(self.icp_trim_ratio),
+        )
+        info["iterations"] = result["iterations"]
+        info["n_correspondences"] = result["n_valid"]
+        info["converged"] = result["converged"]
+        if result["n_valid"] >= 6:
+            info["hessian"] = result["H"]
+        if "tree_build_ms" in result:
+            info["tree_build_ms"] = float(result["tree_build_ms"])
+        if "gn_loop_ms" in result:
+            info["gn_loop_ms"] = float(result["gn_loop_ms"])
+        return result["T"], info
 
-        # ── C++ fast path: full GN loop in Eigen (C1 FIM weight supported in C++ when use_fim_weight) ───
-        if _CPP_CORE_AVAILABLE:
-            result = _cpp_core.icp_register(
-                np.ascontiguousarray(src_xyz, dtype=np.float64),
-                np.ascontiguousarray(src_intensities, dtype=np.float64),
-                np.ascontiguousarray(target_means_4d, dtype=np.float64),
-                np.ascontiguousarray(target_precisions.reshape(n_target, 4, 4), dtype=np.float64),
-                np.ascontiguousarray(target_grads, dtype=np.float64),
-                np.ascontiguousarray(means_t, dtype=np.float64),
-                np.ascontiguousarray(T, dtype=np.float64),
-                float(corr_dist),
-                float(self.alpha),
-                int(self.max_iter),
-                float(self.huber_delta),
-                6,  # min_valid
-                bool(self.use_fim_weight),
-            )
-            info["iterations"] = result["iterations"]
-            info["n_correspondences"] = result["n_valid"]
-            info["converged"] = result["converged"]
-            if result["n_valid"] >= 6:
-                info["hessian"] = result["H"]
-            return result["T"], info
-
-        # ── Python/GPU fallback (used if C++ not built) ───────────────────────
-        for iteration in range(self.max_iter):
-            R_cur = T[:3, :3]
-            t_cur = T[:3, 3]
-
-            # 1. Transform all source points: (N, 3)
-            src_transformed = (R_cur @ src_xyz.T).T + t_cur
-
-            # 2. Batch KNN query
-            dists, indices = tree_t.query(src_transformed, k=1, distance_upper_bound=corr_dist)
-
-            # 3. Valid correspondence mask
-            valid = (indices < n_target) & (dists <= corr_dist)
-            valid_idx = np.where(valid)[0]
-            n_valid = len(valid_idx)
-            if n_valid < 6:
-                break
-
-            info["n_correspondences"] = n_valid
-
-            # 4. Gather all correspondence data (vectorized)
-            src_valid = src_xyz[valid_idx]  # (M', 3)
-            src_trans_valid = src_transformed[valid_idx]  # (M', 3)
-            src_int_valid = src_intensities[valid_idx]  # (M',)
-            tidx = indices[valid_idx]  # (M',)
-
-            # 5-7. Residuals + Jacobians + Hessian (GPU or numpy)
-            # target arrays gathered from GPU cache by correspondence indices
-            t_means_g, t_prec_g, t_grad_g = self._gpu_cache.gather(tidx)
-            t_means_np = t_means_g.cpu().numpy() if hasattr(t_means_g, "cpu") else t_means_g
-            t_prec_np = t_prec_g.cpu().numpy() if hasattr(t_prec_g, "cpu") else t_prec_g
-
-            # 8. Huber robust kernel on 4D Mahalanobis residual (r_i = sqrt(d_i^T Ω_i d_i)).
-            # Downweights geometry and intensity outliers consistently in 4D.
-            if self.huber_delta > 0 and n_valid > 0:
-                d_xyz = src_trans_valid - t_means_np[:, :3]
-                d_i = self.alpha * src_int_valid - t_means_np[:, 3]
-                d_4d = np.column_stack([d_xyz, d_i])
-                r_sq = np.einsum("mi,mij,mj->m", d_4d, t_prec_np, d_4d)
-                r = np.sqrt(np.maximum(r_sq, 0.0))
-                weights = np.where(r < self.huber_delta, np.ones(n_valid), self.huber_delta / (r + 1e-9))
-            else:
-                weights = None
-
-            # 8b. C1: FIM-based per-voxel weight (v^T H_i v, v = min eig of I_G).
-            t_grad_np = t_grad_g.cpu().numpy() if hasattr(t_grad_g, "cpu") else t_grad_g
-            if self.use_fim_weight and n_valid >= 6:
-                I3 = np.eye(3)
-                Rp = src_trans_valid
-                J_xyz = np.zeros((n_valid, 3, 6), dtype=np.float64)
-                J_xyz[:, 0, 1] = Rp[:, 2]
-                J_xyz[:, 0, 2] = -Rp[:, 1]
-                J_xyz[:, 1, 0] = -Rp[:, 2]
-                J_xyz[:, 1, 2] = Rp[:, 0]
-                J_xyz[:, 2, 0] = Rp[:, 1]
-                J_xyz[:, 2, 1] = -Rp[:, 0]
-                J_xyz[:, :, 3:6] = I3[np.newaxis]
-                Omega_geo = t_prec_np[:, :3, :3]
-                I_G = np.einsum("mji,mjk,mkl->il", J_xyz, Omega_geo, J_xyz)
-                I_G = 0.5 * (I_G + I_G.T)
-                eigvals, eigvecs = np.linalg.eigh(I_G)
-                v = eigvecs[:, 0]
-                J_full = np.zeros((n_valid, 4, 6), dtype=np.float64)
-                J_full[:, :3, :] = J_xyz
-                J_full[:, 3, :] = -self.alpha * np.einsum("mi,mij->mj", t_grad_np, J_xyz)
-                H_all = np.einsum("mji,mjk,mkl->mil", J_full, t_prec_np, J_full)
-                w_fim = np.einsum("j,mjk,k->m", v, H_all, v)
-                w_fim = np.maximum(w_fim, 1e-12)
-                w_fim = w_fim / (np.mean(w_fim) + 1e-9)
-                if weights is not None:
-                    weights = weights * w_fim
-                else:
-                    weights = w_fim
-
-            # 8c. A.2 Degeneracy-aware intensity weighting (Proposition 1): when κ_geo >= threshold,
-            # upweight intensity residual for correspondences i with v^T (J_int_i^T J_int_i) v large.
-            if self.use_degeneracy_aware_intensity_weight and n_valid >= 6:
-                if not self.use_fim_weight:
-                    I3 = np.eye(3)
-                    Rp = src_trans_valid
-                    J_xyz = np.zeros((n_valid, 3, 6), dtype=np.float64)
-                    J_xyz[:, 0, 1] = Rp[:, 2]
-                    J_xyz[:, 0, 2] = -Rp[:, 1]
-                    J_xyz[:, 1, 0] = -Rp[:, 2]
-                    J_xyz[:, 1, 2] = Rp[:, 0]
-                    J_xyz[:, 2, 0] = Rp[:, 1]
-                    J_xyz[:, 2, 1] = -Rp[:, 0]
-                    J_xyz[:, :, 3:6] = I3[np.newaxis]
-                    Omega_geo = t_prec_np[:, :3, :3]
-                    I_G = np.einsum("mji,mjk,mkl->il", J_xyz, Omega_geo, J_xyz)
-                    I_G = 0.5 * (I_G + I_G.T)
-                    eigvals, eigvecs = np.linalg.eigh(I_G)
-                    v = eigvecs[:, 0]
-                else:
-                    # v already set above from I_G
-                    pass
-                lam_min, lam_max = float(np.min(eigvals)), float(np.max(eigvals))
-                kappa_geo = lam_max / max(lam_min, 1e-15)
-                if kappa_geo >= self.degeneracy_kappa_threshold:
-                    # J_int_i = -alpha * (grad_i^T J_xyz_i) -> (6,) per point; J_int (n_valid, 6)
-                    J_int = -self.alpha * np.einsum("mi,mij->mj", t_grad_np, J_xyz)
-                    # w_i = (J_int_i @ v)^2 = contribution of intensity to I_total along v
-                    w_degen = np.einsum("mj,j->m", J_int, v) ** 2
-                    w_degen = np.maximum(w_degen, 1e-12)
-                    w_degen = w_degen / (np.mean(w_degen) + 1e-9)
-                    if weights is not None:
-                        weights = weights * w_degen
-                    else:
-                        weights = w_degen
-
-            H, b = gn_hessian_gradient(
-                src_trans_valid,
-                src_int_valid,
-                t_means_g,
-                t_prec_g,
-                t_grad_g,
-                R_cur,
-                self.alpha,
-                self._device,
-                weights=weights,
-            )
-
-            # 9. Solve: δ = -(H + λI)^{-1} b  with capped Marquardt damping.
-            #
-            # Problem with uncapped λ = 1e-4 × max_diag(H):
-            #   KITTI outdoor: Ω_zz from ground voxels → max_diag(H) ~ 1e9,
-            #   λ = 1e5.  Forward-direction H_xx ~ 5000 → step ≈ 5% GN.
-            #   100 iters × 5% → 63% convergence only → significant residual drift.
-            #
-            # Fix: cap λ at 100 (near-GN for typical H_ii >> 100):
-            #   H_xx=5000 → step = 98% GN  → converges in 2-3 iters  ✓
-            #   H_zz=1e9  → step ≈ 100% GN → converges in 1 iter      ✓
-            #   H_ii→0    → step bounded at b_ii/100                   ✓ (degenerate safe)
-            try:
-                lm_lambda = float(np.clip(1e-4 * np.max(np.abs(np.diag(H))), 1e-6, 100.0))
-                delta = np.linalg.solve(H + lm_lambda * np.eye(6), -b)
-            except np.linalg.LinAlgError:
-                break
-
-            # 9. Pose update: T ← exp(δ) · T  (left perturbation on SE(3))
-            R_d, t_d = se3_exp(delta)
-            T_d = np.eye(4)
-            T_d[:3, :3] = R_d
-            T_d[:3, 3] = t_d
-            T = T_d @ T
-
-            info["iterations"] = iteration + 1
-            if np.linalg.norm(delta) < self.conv_thresh:
-                info["converged"] = True
-                break
-
-        # Store the final Hessian for FORM-style window smoothing.
-        # H approximates the Fisher information of the pose measurement:
-        # high eigenvalues = well-constrained DOFs, low = degenerate DOFs.
-        if H is not None:
-            info["hessian"] = H
-        return T, info
 
     def register(
         self,
@@ -593,7 +477,9 @@ class IVGICP:
         Register source to target via geo-photometric Gauss-Newton optimization.
         Returns 4×4 transformation T such that T @ p_source ≈ p_target.
 
-        Uses fully vectorized Gauss-Newton (NumPy einsum) for performance.
+        **Legacy / offline:** builds the target voxel grid in Python (`_build_target_map`).
+        Real-time odometry uses `IVGICPPipeline` + C++ `VoxelMap` + `register_with_arrays` instead.
+        GN solve is C++ `icp_register` (same core as the pipeline).
         """
         if source_points.shape[1] < 3:
             raise ValueError("Points must have at least 3 dimensions (x, y, z)")
@@ -634,15 +520,14 @@ class IVGICP:
         max_corr_dist: Optional[float] = None,
     ) -> Tuple[np.ndarray, dict]:
         """
-        Register source to a pre-built voxel map (from FlatVoxelMap/AdaptiveFlatVoxelMap or C++ VoxelMap).
+        Register source to a pre-built voxel map (Python `Voxel4D` list + KDTree).
 
-        This avoids rebuilding the target voxel grid and allows adaptive
-        voxel statistics (variable-resolution covariances) to be used directly.
+        **Legacy:** prefer `register_with_arrays` + C++ `VoxelMap.build_target_arrays` for odometry.
 
         Args:
             source_points: (N, 3+) source scan
             source_intensities: (N,) intensity values
-            target_voxels: pre-built Voxel4D list (from adaptive map)
+            target_voxels: pre-built Voxel4D list
             target_means_3d: (M, 3) voxel centers (for KDTree)
             target_tree: pre-built KDTree on target_means_3d
             init_pose: initial pose estimate

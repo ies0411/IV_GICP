@@ -23,7 +23,7 @@ import numpy as np
 # Reuse data loaders and metrics from run_ablation
 import run_ablation as ra
 
-MAX_FRAMES = 50
+MAX_FRAMES = 100
 
 
 def run_iv_gicp_full_subprocess(dataset_key, max_frames, device):
@@ -106,7 +106,6 @@ def run_worker(dataset_key, method, max_frames, device="auto"):
             alpha=ds["alpha"],
             use_fim_weight=True,
             use_entropy_alpha=True,
-            window=1,
             params=ds["params"],
             device=device,
             auto_alpha=True,
@@ -146,7 +145,7 @@ def run_worker(dataset_key, method, max_frames, device="auto"):
 
 def main():
     parser = argparse.ArgumentParser(description="IV-GICP Full vs KISS-ICP (50 fr per dataset)")
-    parser.add_argument("--device", default="auto")
+    parser.add_argument("--device", default="cpu")
     parser.add_argument("--max-frames", type=int, default=MAX_FRAMES)
     parser.add_argument("--datasets", nargs="+", default=["kitti", "subt", "metro", "geode"], help="Dataset keys to run")
     parser.add_argument("--worker", action="store_true", help=argparse.SUPPRESS)
@@ -172,21 +171,22 @@ def main():
         print(f"ATE={ate_kiss:.4f}m  RPE={rpe_kiss:.4f}m  {ms_kiss:.0f}ms/fr")
         results.append((k, ds["label"], ate_iv, rpe_iv, ms_iv, ate_kiss, rpe_kiss, ms_kiss))
 
-    print("\n" + "=" * 80)
-    print("  IV-GICP Full vs KISS-ICP  (50 frames per dataset)")
-    print("=" * 80)
-    print(f"  {'Dataset':<28}  {'IV-GICP ATE':>10}  {'KISS ATE':>10}  {'Winner':<8}  {'IV-GICP RPE':>10}  {'KISS RPE':>10}")
-    print("  " + "-" * 76)
+    print("\n" + "=" * 100)
+    print("  IV-GICP Full vs KISS-ICP  ({} frames per dataset) — 정확도 + 속도".format(args.max_frames))
+    print("=" * 100)
+    print(f"  {'Dataset':<24}  {'ATE (m)':>16}  {'RPE (m)':>16}  {'속도 (ms/fr)':>18}  {'정확도':<10}")
+    print(f"  {'':24}  {'IV-GICP':>8}  {'KISS':>8}  {'IV-GICP':>8}  {'KISS':>8}  {'IV-GICP':>8}  {'KISS':>8}")
+    print("  " + "-" * 96)
     for k, label, ate_iv, rpe_iv, ms_iv, ate_kiss, rpe_kiss, ms_kiss in results:
         if np.isnan(ate_iv):
-            print(f"  {label:<28}  {'—':>10}  {'—':>10}  skip")
+            print(f"  {label:<24}  {'—':>8}  {'—':>8}  {'—':>8}  {'—':>8}  {'—':>8}  {'—':>8}  skip")
             continue
         if np.isnan(ate_kiss):
-            winner = "IV-GICP (KISS n/a)"
+            acc_winner = "IV-GICP"
         else:
-            winner = "IV-GICP" if ate_iv < ate_kiss else "KISS-ICP"
-        print(f"  {label:<28}  {ate_iv:>10.4f}  {ate_kiss:>10.4f}  {winner:<8}  {rpe_iv:>10.4f}  {rpe_kiss:>10.4f}")
-    print("=" * 80)
+            acc_winner = "IV-GICP" if ate_iv < ate_kiss else "KISS-ICP"
+        print(f"  {label:<24}  {ate_iv:>8.4f}  {ate_kiss:>8.4f}  {rpe_iv:>8.4f}  {rpe_kiss:>8.4f}  {ms_iv:>8.0f}  {ms_kiss:>8.0f}  {acc_winner:<10}")
+    print("=" * 100)
 
 
 if __name__ == "__main__":
