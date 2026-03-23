@@ -68,15 +68,17 @@ metro:
   loader: load_metro
   loader_kw: {}
   label: 'GEODE Metro Shield_tunnel1 (metro tunnel, Livox Mid-360)'
-  alpha: 0.5                  # metallic walls/windows → intensity helps
+  alpha: 0.0                  # geometry-only: uniform concrete/metal tunnel walls
+                              # (grid search 2026-03-23: alpha=0.0 consistently beats alpha=0.5)
   params:
     voxel_size: 0.5
-    source_voxel_size: 0.2
-    max_correspondence_distance: 1.5
+    source_voxel_size: 0.25   # finer source resolution (0.2→0.25 tradeoff: seq3 +seq2 win)
+    max_correspondence_distance: 0.8  # tighter matching for tunnel geometry
+                                       # (0.8 beats 1.0/1.5 in 500fr cross-seq validation)
     initial_threshold: 1.5
     min_motion_th: 0.5
     max_map_frames: 200
-    max_iterations: 12
+    max_iterations: 20        # 20 itr needed for 500fr convergence stability (12 causes path explosion)
     min_range: 0.5
     max_range: 60.0
     map_radius: 60.0          # spatial eviction (tunnel corridor)

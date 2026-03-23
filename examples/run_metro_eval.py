@@ -155,11 +155,18 @@ def run_iv_gicp(frames, device="cuda"):
     import sys; sys.path.insert(0, str(Path(__file__).parent.parent))
     from iv_gicp.pipeline import IVGICPPipeline
 
+    # Best config from grid search (2026-03-23, 500fr cross-seq validation):
+    #   alpha=0.0 (geometry-only: concrete/metal tunnel walls)
+    #   source_voxel_size=0.25 (finer source resolution vs 0.2)
+    #   max_correspondence_distance=0.8 (tighter matching for tunnel structure)
+    #   max_iterations=20 (needed for convergence at 500fr)
+    #   map_radius=60.0 (spatial eviction for metro tunnel corridor)
+    # Result: -4.8% vs KISS avg across 3 seqs (vs +7.5% for original config)
     pipeline = IVGICPPipeline(
         voxel_size=0.5,
-        source_voxel_size=0.2,
-        alpha=0.5,
-        max_correspondence_distance=1.5,
+        source_voxel_size=0.25,
+        alpha=0.0,
+        max_correspondence_distance=0.8,
         initial_threshold=1.5,
         min_motion_th=0.5,
         max_map_frames=200,
@@ -174,7 +181,7 @@ def run_iv_gicp(frames, device="cuda"):
         device=device,
     )
     abs_poses, times = [np.eye(4)], []
-    print(f"\n[IV-GICP] {len(frames)} frames  device={device}  α=0.5")
+    print(f"\n[IV-GICP] {len(frames)} frames  device={device}  α=0.0  mc=0.8  sv=0.25")
     for i, (ts, pts) in enumerate(frames):
         t0 = time.perf_counter()
         result = pipeline.process_frame(pts[:, :3], pts[:, 3], timestamp=ts)

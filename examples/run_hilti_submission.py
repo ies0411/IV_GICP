@@ -62,10 +62,17 @@ IV_GICP_PARAMS = dict(
     source_voxel_size=0.2,
     alpha=0.5,                         # intensity important in degenerate corridor
     max_correspondence_distance=0.5,   # tight: slow indoor robot
-    initial_threshold=0.15,
-    min_motion_th=0.03,
-    max_iterations=20,
+    initial_threshold=0.5,
+    min_motion_th=0.5,                 # sigma floor: prevents cascade failure in corridor
+    max_iterations=20,                 # dense Pandar64 (~50k pts) needs more iters
     map_radius=40.0,                   # spatial eviction: 40m bubble
+    min_range=0.5,
+    max_range=40.0,                    # indoor: cap at 40m
+    auto_alpha=False,
+    auto_alpha_from_intensity=False,
+    source_drop_small_voxels=False,
+    source_max_output_features=0,
+    max_source_points=0,
 )
 
 

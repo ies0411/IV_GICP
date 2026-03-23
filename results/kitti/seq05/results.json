@@ -21,6 +21,10 @@
       "reg_ms": 91.12697921297654,
       "map_ms": 70.7228482936048,
       "sparse_mode": null
+    },
+    "GenZ-ICP": {
+      "ate_rmse": 0.3245004478529249,
+      "n_frames": 500
     }
   },
   "speed_vs_kiss": {
