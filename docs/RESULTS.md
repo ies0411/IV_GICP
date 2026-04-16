@@ -65,7 +65,7 @@
 
 ## 3. SubT-MRS Underground/Mine (VLP-16)
 
-**Params:** `voxel=0.5, source=0.3, alpha=0.1, mc=2.0, mf=200, itr=12, max_range=50m, map_radius=200m, min_th=0.5`
+**Params:** `voxel=0.5, source=0.3, alpha=0.1, mc=2.0, mf=200, itr=12, max_range=80m, map_radius=200m, min_th=0.5`
 
 | Dataset    | IV-GICP   | KISS-ICP  | GenZ-ICP | IV vs KISS | IV vs GenZ |
 | ---------- | --------- | --------- | -------- | ---------- | ---------- |
@@ -130,18 +130,19 @@
 
 ## 6. Speed Summary
 
-| Dataset            | Sensor                   | IV-GICP   | KISS-ICP  | Ratio           |
-| ------------------ | ------------------------ | --------- | --------- | --------------- |
-| KITTI seq00        | HDL-64E (~15k pts)       | ~1090 ms  | ~229 ms   | 4.7× slower     |
-| GEODE Urban Tunnel | VLP-16 (~21k pts)        | ~62 ms    | ~110 ms   | **1.8× faster** |
-| SubT Final_UGV1    | VLP-16 (~8k pts)         | ~270 ms   | ~115 ms   | 2.3× slower     |
-| MulRan DCC01       | Ouster OS1-64 (~36k pts) | faster    | —         | **IV faster**   |
-| HeLiPR DCC05       | Ouster OS1-64 (~36k pts) | faster    | —         | **IV faster**   |
-| GEODE Metro        | Livox Mid-360 (~30k pts) | ~400 ms   | ~550 ms   | **1.4× faster** |
+| Dataset            | Sensor                   | IV-GICP  | KISS-ICP | Ratio           |
+| ------------------ | ------------------------ | -------- | -------- | --------------- |
+| KITTI seq00        | HDL-64E (~15k pts)       | ~1090 ms | ~229 ms  | 4.7× slower     |
+| SubT Final_UGV1    | VLP-16 (~8k pts)         | ~43 ms   | ~33 ms   | 1.3× slower     |
+| GEODE Urban Tunnel | VLP-16 (~21k pts)        | ~62 ms   | ~110 ms  | **1.8× faster** |
+| GEODE Metro        | Livox Mid-360 (~30k pts) | ~400 ms  | ~550 ms  | **1.4× faster** |
+| MulRan KAIST01     | Ouster OS1-64 (~36k pts) | ~107 ms  | ~165 ms  | **1.5× faster** |
+| HeLiPR KAIST05     | Ouster OS1-64 (~36k pts) | ~107 ms  | ~200 ms  | **1.9× faster** |
 
-> **Note:** KITTI speed is on CPU single-thread (no parallelism benefit).
-> GEODE Urban now shows IV FASTER than KISS (62ms vs 110ms) with correct params (itr=12).
-> Ouster/Livox high-density scans: IV-GICP consistently faster due to C++ KDTree + OpenMP.
+> **Note:** KITTI speed is CPU single-thread (multi-itr GN is the bottleneck, not KDTree).
+> GEODE Urban: IV FASTER than KISS (62ms vs 110ms) with correct params (itr=12, corrected 2026-04-16).
+> Dense sensors (>20k pts): IV-GICP is consistently faster due to C++ KDTree + OpenMP parallelism.
+> Pattern: IV slower for sparse VLP-16 (<15k pts, KITTI/SubT), faster for dense Ouster/Livox (>20k pts).
 
 ---
 
