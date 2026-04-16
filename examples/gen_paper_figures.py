@@ -318,36 +318,43 @@ def make_speed_figure(save_prefix):
     bars_iv   = ax.barh(y + h/2, iv_ms,   h, label="IV-GICP (ours)", color=iv_colors,   alpha=0.85)
     bars_kiss = ax.barh(y - h/2, kiss_ms, h, label="KISS-ICP",        color=kiss_colors, alpha=0.70)
 
-    # Ratio annotations
+    # Ratio annotations (place to left of the shorter bar end to avoid x-axis overflow)
+    xmax = max(kiss_ms.max(), iv_ms.max()) * 1.4
     for i, (iv, ki) in enumerate(zip(iv_ms, kiss_ms)):
         ratio = iv / ki
+        bar_end = max(iv, ki)
         if ratio < 1:
-            txt = f"{1/ratio:.1f}× faster"
+            txt = f"  {1/ratio:.1f}× faster"
             col = "#007700"
         else:
-            txt = f"{ratio:.1f}× slower"
+            txt = f"  {ratio:.1f}× slower"
             col = "#cc0000"
-        ax.text(max(iv, ki) + 15, y[i], txt,
-                va="center", fontsize=7.5, color=col, fontweight="bold")
+        # For very long bars (KITTI), place annotation just after the kiss bar end
+        x_pos = min(bar_end + 10, xmax * 0.75) if bar_end > xmax * 0.7 else bar_end + 10
+        ax.text(x_pos, y[i], txt, va="center", fontsize=7.5, color=col, fontweight="bold")
 
     ax.set_yticks(y)
     ax.set_yticklabels(labels, fontsize=8)
     ax.set_xlabel("Processing time [ms/frame]", fontsize=9)
-    ax.set_title("IV-GICP vs KISS-ICP Processing Speed per Frame\n"
-                 "(blue = IV faster; gray = IV slower)",
+    ax.set_title("IV-GICP vs KISS-ICP Processing Speed per Frame",
                  fontsize=10, fontweight="bold")
-    ax.legend(fontsize=8, loc="lower right")
+    ax.legend(fontsize=8, loc="upper right")
     ax.grid(True, axis="x", alpha=0.3, lw=0.4)
-    ax.set_xlim(0, max(kiss_ms.max(), iv_ms.max()) * 1.35)
+    ax.set_xlim(0, xmax)
 
-    # Vertical separator between slow and fast IV regions
+    # Horizontal separator between sparse (IV slower, bottom) and dense (IV faster, top)
+    # The separator is between y=1 (SubT) and y=2 (GEODE Urban)
     ax.axhline(1.5, color="#999999", lw=0.8, ls=":", alpha=0.6)
-    ax.text(0.97, 0.58, "Dense sensors\n(IV-GICP faster)",
+    # Dense sensors (top, y=2..5): IV faster — place in right margin
+    ax.text(0.99, 0.78, "Dense sensors\n(IV-GICP faster)",
             transform=ax.transAxes, ha="right", va="center",
-            fontsize=8, color="#007700", style="italic")
-    ax.text(0.97, 0.83, "Sparse sensors\n(KISS faster)",
+            fontsize=8, color="#007700", style="italic",
+            bbox=dict(boxstyle="round,pad=0.2", facecolor="white", alpha=0.7))
+    # Sparse sensors (bottom, y=0..1): KISS faster
+    ax.text(0.99, 0.16, "Sparse sensors\n(KISS faster)",
             transform=ax.transAxes, ha="right", va="center",
-            fontsize=8, color="#cc0000", style="italic")
+            fontsize=8, color="#cc0000", style="italic",
+            bbox=dict(boxstyle="round,pad=0.2", facecolor="white", alpha=0.7))
 
     fig.tight_layout()
     for ext in ["pdf", "png"]:
