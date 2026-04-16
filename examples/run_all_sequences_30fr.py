@@ -25,7 +25,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import run_ablation as ra
 
-MULRAN_ROOT = Path("/home/km/data/MulRan")
+MULRAN_ROOT = Path("/home/km/deepai_dev_data/MulRan")
 
 
 # ── MulRan loader ──────────────────────────────────────────────────────────────

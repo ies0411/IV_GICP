@@ -24,7 +24,7 @@ import time
 from pathlib import Path
 import numpy as np
 
-GEODE_ROOT = Path("/home/km/data/GEODE")
+GEODE_ROOT = Path("/home/km/deepai_dev_data/GEODE")
 LIDAR_TOPIC = "/livox/lidar"
 
 

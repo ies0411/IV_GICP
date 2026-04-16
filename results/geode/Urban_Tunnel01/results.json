@@ -1,32 +1,32 @@
 {
   "meta": {
     "seq": "Urban_Tunnel01",
-    "bag": "/home/km/data/GEODE/sensor_data/Urban_tunnel/Urban_Tunnel01/Urban_Tunnel01.bag",
+    "bag": "/home/km/deepai_dev_data/GEODE/sensor_data/Urban_tunnel/Urban_Tunnel01/Urban_Tunnel01.bag",
     "n_frames": 500,
     "duration_s": 49.89592409133911,
-    "avg_pts_per_frame": 18647.694,
+    "avg_pts_per_frame": 21338.01,
     "gt_path_m": 335.65927837997873,
     "gt_end_disp_m": 303.7785580354149
   },
   "methods": {
     "KISS-ICP": {
-      "mean_ms": 146.61298801843077,
-      "hz": 6.820678123511743,
-      "path_length_m": 331.7733283406001,
-      "end_displacement_m": 300.9287271426411,
-      "ate_rmse_m": 4.396174992654895,
+      "mean_ms": 121.18916804157197,
+      "hz": 8.251562546059944,
+      "path_length_m": 334.45372005765284,
+      "end_displacement_m": 303.0706774054165,
+      "ate_rmse_m": 1.9062184877600947,
       "n_frames": 500
     },
     "IV-GICP": {
-      "mean_ms": 119.32692121348543,
-      "hz": 8.380338567613924,
-      "reg_ms": 89.92177092718457,
-      "map_ms": 20.266117026025285,
-      "path_length_m": 332.91728905944194,
-      "end_displacement_m": 305.1851921824705,
-      "ate_rmse_m": 2.7057001382317147,
+      "mean_ms": 61.1774165851469,
+      "hz": 16.345901082766336,
+      "reg_ms": 34.77322055635328,
+      "map_ms": 19.710418613317735,
+      "path_length_m": 336.7987780781134,
+      "end_displacement_m": 304.6027407729726,
+      "ate_rmse_m": 1.001487469343448,
       "n_frames": 500,
-      "device": "cuda"
+      "device": "cpu"
     }
   }
 }

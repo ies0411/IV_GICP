@@ -33,7 +33,7 @@ import numpy as np
 
 DATASETS = {
     "2021": {
-        "base": "/home/km/data/hilti/2021",
+        "base": "/home/km/deepai_dev_data/hilti/2021",
         "lidar_topic": "/os_cloud_node/points",
         "parser": "ouster",   # Ouster OS0/OS1
         "sequences": [
@@ -45,7 +45,7 @@ DATASETS = {
         ],
     },
     "2022": {
-        "base": "/home/km/data/hilti/2022",
+        "base": "/home/km/deepai_dev_data/hilti/2022",
         "lidar_topic": "/hesai/pandar",
         "parser": "hesai",    # Hesai Pandar64
         "sequences": [

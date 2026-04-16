@@ -19,15 +19,15 @@ import numpy as np
 import sys
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-GEODE_ROOT   = Path("/home/km/data/GEODE")
+GEODE_ROOT   = Path("/home/km/deepai_dev_data/GEODE")
 RESULTS_ROOT = Path(__file__).parent.parent / "results" / "geode"
 RUNNER = Path(__file__).parent.parent / "thirdparty/genz-icp/bin_runner/build/genz_bin_runner"
 LIDAR_TOPIC  = "/velodyne_points"
 
-# Best params for GEODE Urban Tunnel: same as IV-GICP (0.5m voxel, 25m range)
+# Best params for GEODE Urban Tunnel: same as IV-GICP (0.5m voxel, 80m range)
 GENZ_PARAMS = dict(
     voxel_size=0.5,
-    max_range=25.0,
+    max_range=80.0,
     min_range=0.5,
     min_motion_th=0.5,
     initial_threshold=1.5,
@@ -62,7 +62,7 @@ def extract_bag_to_bins(bag_path: Path, out_dir: Path, max_frames: int = None):
     return timestamps
 
 
-def _parse_vlp16(msg, max_range=25.0):
+def _parse_vlp16(msg, max_range=80.0):
     data = np.frombuffer(bytes(msg.data), dtype=np.uint8).reshape(-1, msg.point_step)
     x   = data[:, 0:4].view(np.float32).reshape(-1)
     y   = data[:, 4:8].view(np.float32).reshape(-1)
@@ -141,8 +141,8 @@ def main():
     seqs = ["01", "02", "03"] if args.seq is None else [args.seq]
 
     # IV-GICP and KISS-ICP reference (CLAUDE.md 2026-03-22, 500fr)
-    iv_ref   = {"Urban_Tunnel01": 2.706, "Urban_Tunnel02": 4.152, "Urban_Tunnel03": 12.528}
-    kiss_ref = {"Urban_Tunnel01": 4.396, "Urban_Tunnel02": 8.085, "Urban_Tunnel03": 13.808}
+    iv_ref   = {"Urban_Tunnel01": 1.001, "Urban_Tunnel02": 1.896, "Urban_Tunnel03": 4.744}
+    kiss_ref = {"Urban_Tunnel01": 1.906, "Urban_Tunnel02": 13.696, "Urban_Tunnel03": 5.452}
 
     all_results = {}
     for seq in seqs:

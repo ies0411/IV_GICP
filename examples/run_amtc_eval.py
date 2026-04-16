@@ -2,7 +2,7 @@
 """
 AMTC Mine Dataset: IV-GICP vs KISS-ICP benchmark.
 
-Bag: /home/km/data/AMTC/00S_data.bag
+Bag: /home/km/deepai_dev_data/AMTC/00S_data.bag
   /riegl  — sensor_msgs/PointCloud  ~110 Hz, ~1027 pts/msg
               channels: ['reflectance'] in dBm
   /tf     — static robot URDF transforms only
@@ -34,7 +34,7 @@ root = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(root))
 sys.path.insert(0, str(root / "examples"))
 
-AMTC_DIR = Path("/home/km/data/AMTC")
+AMTC_DIR = Path("/home/km/deepai_dev_data/AMTC")
 AMTC_BAG = AMTC_DIR / "00S_data.bag"
 AMTC_GT  = AMTC_DIR / "scanPoseEstimates.dat.tar.bz2"
 

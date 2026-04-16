@@ -23,7 +23,7 @@ import time
 from pathlib import Path
 import numpy as np
 
-BAG_PATH = "/home/km/data/hilti/2022/exp07_long_corridor.bag"
+BAG_PATH = "/home/km/deepai_dev_data/hilti/2022/exp07_long_corridor.bag"
 LIDAR_TOPIC = "/hesai/pandar"
 
 # ── Hilti bag reader ──────────────────────────────────────────────────────────

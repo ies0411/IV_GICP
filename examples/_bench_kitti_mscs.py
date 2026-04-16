@@ -10,7 +10,7 @@ from pathlib import Path
 import numpy as np
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-KITTI_ROOT = Path("/home/km/data/kitti/dataset")
+KITTI_ROOT = Path("/home/km/deepai_dev_data/kitti/dataset")
 DEFAULT_SEQS = ["00", "05"]
 MAX_FRAMES = 100
 

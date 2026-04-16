@@ -7,7 +7,7 @@ Supports:
   - Final Challenge UGV1/UGV2 (VLP-16, mine/tunnel)
   - Laurel Caverns Handheld3 (cave)
 
-Data source: /home/km/data/SubT-MRS/
+Data source: /home/km/deepai_dev_data/SubT-MRS/
   rosbag/{dataset}.zip   → raw VLP-16 bags (velodyne_packets)
   LiDAR_Inertial_Track/{dataset}.zip → ground_truth_path.csv
 
@@ -46,7 +46,7 @@ from iv_gicp.pipeline import IVGICPPipeline
 
 # ─── SubT-MRS dataset registry ────────────────────────────────────────────────
 
-BASE_DIR = "/home/km/data/SubT-MRS"
+BASE_DIR = "/home/km/deepai_dev_data/SubT-MRS"
 
 DATASETS = {
     "Urban_UGV1": {

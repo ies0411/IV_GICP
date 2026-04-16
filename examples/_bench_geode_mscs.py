@@ -7,7 +7,7 @@ sys.path.insert(0, str(Path(__file__).parent))
 
 from run_geode_eval import read_geode_frames, load_geode_gt, interpolate_gt_at_lidar_times
 
-GEODE_ROOT = Path("/home/km/data/GEODE")
+GEODE_ROOT = Path("/home/km/deepai_dev_data/GEODE")
 SEQ = "Urban_Tunnel01"
 MAX_FRAMES = 100
 

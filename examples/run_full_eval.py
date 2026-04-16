@@ -35,10 +35,10 @@ sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(ROOT / "examples"))
 
 # ── Dataset paths ──────────────────────────────────────────────────────────────
-KITTI_ROOT  = Path("/home/km/data/kitti/dataset")
-SUBT_ROOT   = Path("/home/km/data/SubT-MRS")
-GEODE_ROOT  = Path("/home/km/data/GEODE")
-MULRAN_ROOT = Path("/home/km/data/MulRan")
+KITTI_ROOT  = Path("/home/km/deepai_dev_data/kitti/dataset")
+SUBT_ROOT   = Path("/home/km/deepai_dev_data/SubT-MRS")
+GEODE_ROOT  = Path("/home/km/deepai_dev_data/GEODE")
+MULRAN_ROOT = Path("/home/km/deepai_dev_data/MulRan")
 
 # ── Best params per domain ─────────────────────────────────────────────────────
 
@@ -176,7 +176,7 @@ def build_sequences():
                          "out_dir": f"subt/{short}"})
 
     # HeLiPR
-    helipr_root = Path("/home/km/data/HeLiPR")
+    helipr_root = Path("/home/km/deepai_dev_data/HeLiPR")
     for seq in ("DCC05", "KAIST05", "Roundabout01"):
         if (helipr_root / seq).exists():
             seqs.append({"label": f"HeLiPR {seq}", "domain": "helipr",
@@ -273,7 +273,7 @@ def load_mulran(seq="DCC01", max_frames=None):
 
 
 def load_helipr(seq="DCC05", max_frames=None):
-    helipr_root = Path("/home/km/data/HeLiPR")
+    helipr_root = Path("/home/km/deepai_dev_data/HeLiPR")
     seq_dir = helipr_root / seq
     for sub in ("Ouster", "os1", "lidar"):
         d = seq_dir / sub

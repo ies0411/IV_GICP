@@ -3,8 +3,8 @@
 MulRan Odometry Benchmark: IV-GICP vs KISS-ICP
 
 Sequences available:
-  /home/km/data/MulRan/DCC01/   — downtown campus (Ouster OS1-64)
-  /home/km/data/MulRan/KAIST01/ — KAIST campus outdoor (Ouster) [needs extraction]
+  /home/km/deepai_dev_data/MulRan/DCC01/   — downtown campus (Ouster OS1-64)
+  /home/km/deepai_dev_data/MulRan/KAIST01/ — KAIST campus outdoor (Ouster) [needs extraction]
 
 Point format: 4 float32/point (x, y, z, intensity)
   Many zero-padded points — filter by r > 0.5
@@ -29,7 +29,7 @@ import numpy as np
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-MULRAN_ROOT  = Path("/home/km/data/MulRan")
+MULRAN_ROOT  = Path("/home/km/deepai_dev_data/MulRan")
 RESULTS_ROOT = Path(__file__).parent.parent / "results" / "mulran"
 
 

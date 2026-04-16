@@ -30,7 +30,7 @@ import time
 from pathlib import Path
 import numpy as np
 
-GEODE_ROOT = Path("/home/km/data/GEODE")
+GEODE_ROOT = Path("/home/km/deepai_dev_data/GEODE")
 LIDAR_TOPIC = "/velodyne_points"
 
 
@@ -64,16 +64,14 @@ def read_geode_frames(bag_path: Path, max_frames: int = None):
     return frames
 
 
-def _parse_velodyne_pc2(msg, max_range: float = 25.0) -> np.ndarray:
+def _parse_velodyne_pc2(msg, max_range: float = 80.0) -> np.ndarray:
     """
     Velodyne VLP-16 PointCloud2 → (N,4) float64 [x,y,z,intensity].
     Fields: x(f32,0) y(f32,4) z(f32,8) intensity(f32,12) ring(u16,16) time(f32,18)
     point_step = 22 bytes
 
-    max_range: clip to nearby points only. In urban tunnel VLP-16 scans, most
-    useful geometry (walls, ceiling, floor) is within 25m. Limiting range
-    increases voxel point density: fewer voxels cover the visible volume →
-    more points per voxel → better covariance estimates → better GICP.
+    max_range: 80m matches ablation loader and datasets.yaml. Longer-range
+    tunnel-axis returns improve context for FIM-weighted (C1) registration.
     """
     data = np.frombuffer(bytes(msg.data), dtype=np.uint8).reshape(-1, msg.point_step)
     x   = data[:, 0:4].view(np.float32).reshape(-1)
@@ -172,10 +170,10 @@ def run_iv_gicp(frames, device="cuda"):
         max_correspondence_distance=2.0,
         initial_threshold=1.5,
         min_motion_th=0.5,           # sigma floor for tunnel environment
-        huber_delta=1.0,
-        max_iterations=30,
+        max_iterations=12,           # optimal: 12 (30 causes divergence on tunnel)
         max_map_frames=500,
         map_radius=80.0,             # spatial eviction for tunnel
+        use_fim_weight=True,         # C1: FIM-weighted correspondences (-22.8% on Urban01)
         auto_alpha=False,
         auto_alpha_from_intensity=False,
         source_drop_small_voxels=False,

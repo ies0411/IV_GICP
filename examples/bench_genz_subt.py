@@ -19,7 +19,7 @@ import numpy as np
 sys.path.insert(0, str(Path(__file__).parent.parent))
 sys.path.insert(0, str(Path(__file__).parent))
 
-BASE_DIR = "/home/km/data/SubT-MRS"
+BASE_DIR = "/home/km/deepai_dev_data/SubT-MRS"
 RESULTS_ROOT = Path(__file__).parent.parent / "results" / "subt"
 RUNNER = Path(__file__).parent.parent / "thirdparty/genz-icp/bin_runner/build/genz_bin_runner"
 

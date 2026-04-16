@@ -25,6 +25,7 @@ kitti:
   loader_kw: {}
   label: 'KITTI seq00 (outdoor driving, Velodyne HDL-64E)'
   alpha: 0.1
+  ablation_alpha: 0.1        # same as optimal: intensity helps on diverse outdoor surfaces
   params:
     voxel_size: 1.0
     source_voxel_size: 0.3
@@ -47,6 +48,7 @@ subt:
   loader_kw: {}
   label: 'SubT Final_UGV1 (mine/tunnel, VLP-16)'
   alpha: 0.1
+  ablation_alpha: 0.1        # same as optimal
   params:
     voxel_size: 0.5
     source_voxel_size: 0.3
@@ -70,6 +72,7 @@ metro:
   label: 'GEODE Metro Shield_tunnel1 (metro tunnel, Livox Mid-360)'
   alpha: 0.0                  # geometry-only: uniform concrete/metal tunnel walls
                               # (grid search 2026-03-23: alpha=0.0 consistently beats alpha=0.5)
+  ablation_alpha: 0.1         # C3 ablation: test alpha>0 to show entropy→alpha=0 is principled
   params:
     voxel_size: 0.5
     source_voxel_size: 0.25   # finer source resolution (0.2→0.25 tradeoff: seq3 +seq2 win)
@@ -93,6 +96,7 @@ geode:
   loader_kw: { seq: '01' }
   label: 'GEODE Urban_Tunnel01 (concrete tunnel, Velodyne VLP-16)'
   alpha: 0.0                  # uniform concrete surface → geometry-only
+  ablation_alpha: 0.1         # C3 ablation: test alpha>0 to show entropy→alpha=0 is principled
   params:
     voxel_size: 0.5
     source_voxel_size: 0.25

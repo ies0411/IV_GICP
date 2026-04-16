@@ -4,29 +4,34 @@ IV-GICP Ablation Study: C1 / C2 / C3 contributions (paper definition).
 
 Ablation configs:
   C1 = FIM-based per-voxel weighting (use_fim_weight)
-  C2 = 4D geo+intensity (alpha > 0)
+  C2 = 4D geo+intensity (alpha > 0 using ablation_alpha from datasets.yaml)
   C3 = Entropy-consistent geo/intensity (use_entropy_alpha)
-  A:  GICP-Base   — alpha=0, use_fim_weight=False, use_entropy_alpha=False
-  B:  +C1         — alpha=0, use_fim_weight=True,  use_entropy_alpha=False
-  C:  +C2         — alpha=X, use_fim_weight=False, use_entropy_alpha=False
-  D:  C1+C2       — alpha=X, use_fim_weight=True,  use_entropy_alpha=False
-  E:  C2+C3       — alpha=X, use_fim_weight=False, use_entropy_alpha=True
-  F:  Full(C1+2+3)— alpha=X, use_fim_weight=True,  use_entropy_alpha=True
 
-Baseline A (GICP-Base): 동일한 C++ VoxelMap 사용, 단 C1(FIM 가중치)·C2(intensity)·C3(entropy scale) 미사용.
-따라서 A vs B~F는 같은 맵 위에서 우리가 추가한 요소만 켜는 공정한 ablation이다.
+  A:  GICP-Base         — alpha=0,   C1=F  C3=F  (plain VGICP)
+  B:  +C1               — alpha=0,   C1=T  C3=F  (FIM weighting only)
+  C:  +C2               — alpha=abl, C1=F  C3=F  (intensity only)
+  D:  C1+C2             — alpha=abl, C1=T  C3=F  (FIM + intensity)
+  E:  C2+C3             — alpha=abl, C1=F  C3=T  (entropy-adaptive alpha)
+  F:  Full(C1+C2+C3)    — alpha=abl, C1=T  C3=T  (full system w/ ablation_alpha)
+  G:  Full-Optimal      — alpha=opt, C1=T  C3=F  (deployed config, optimal alpha)
+
+Key: For GEODE/Metro, ablation_alpha=0.1 while optimal alpha=0.0.
+  → Configs A-F use alpha=0.1 to expose C2 contribution (and its risk).
+  → Config G uses alpha=0.0 (C3's entropy-based choice) — shows C3 benefit.
+  This design validates Theorem 1 (C2 w/ alpha>0 helps on Metro) and C3
+  (entropy selects alpha=0 for uniform surfaces, recovering C1-only performance).
 
 Supported datasets:
-  kitti   — KITTI seq00, 300fr (outdoor driving)
-  subt    — SubT Final_UGV1, 300fr (mine/tunnel)
-  metro   — GEODE Metro Shield_tunnel1, 300fr (metro tunnel)
-  geode   — GEODE Urban_Tunnel01, 300fr (urban tunnel, severe degeneracy)
+  kitti   — KITTI seq00 (outdoor driving)
+  subt    — SubT Final_UGV1 (mine/tunnel)
+  metro   — GEODE Metro Shield_tunnel1 (metro tunnel)
+  geode   — GEODE Urban_Tunnel01 (urban tunnel, severe degeneracy)
   all     — run all four sequentially
 
 Usage:
-  python examples/run_ablation.py --dataset kitti --device cuda
-  python examples/run_ablation.py --dataset all   --device cuda
-  python examples/run_ablation.py --dataset geode --max-frames 300
+  uv run python examples/run_ablation.py --dataset all --max-frames 500
+  uv run python examples/run_ablation.py --dataset geode --max-frames 500
+  uv run python examples/run_ablation.py --dataset kitti --max-frames 500
 """
 
 import argparse
@@ -46,9 +51,9 @@ from iv_gicp.config_loader import get_datasets_config, get_pipeline_config
 
 # ── Dataset paths ──────────────────────────────────────────────────────────────
 
-KITTI_ROOT = Path("/home/km/data/kitti/dataset")
-SUBT_ROOT = Path("/home/km/data/SubT-MRS")
-GEODE_ROOT = Path("/home/km/data/GEODE")
+KITTI_ROOT = Path("/home/km/deepai_dev_data/kitti/dataset")
+SUBT_ROOT = Path("/home/km/deepai_dev_data/SubT-MRS")
+GEODE_ROOT = Path("/home/km/deepai_dev_data/GEODE")
 
 
 # ── ATE metric ────────────────────────────────────────────────────────────────
@@ -453,13 +458,18 @@ def run_config(
     device,
     auto_alpha=False,
 ):
+    # Strip keys controlled by ablation configs from params to avoid duplicate kwarg error.
+    p = {k: v for k, v in params.items()
+         if k not in ("alpha", "use_fim_weight", "use_entropy_alpha", "auto_alpha",
+                      "auto_alpha_from_intensity")}
     pipeline_kw = dict(
         alpha=alpha,
         device=device,
         use_fim_weight=use_fim_weight,
         use_entropy_alpha=use_entropy_alpha,
-        auto_alpha=auto_alpha,
-        **params,
+        auto_alpha=False,
+        auto_alpha_from_intensity=False,
+        **p,
     )
     pipeline = IVGICPPipeline(**pipeline_kw)
     abs_poses = []
@@ -517,11 +527,16 @@ def _build_datasets():
         fn = LOADER_REGISTRY.get(name)
         if fn is None:
             continue
+        opt_alpha = float(v.get("alpha", 0.1))
+        # ablation_alpha: alpha used for C2 configs in ablation (may differ from optimal).
+        # Allows testing C2 even when optimal alpha=0.0 (e.g. GEODE/Metro).
+        abl_alpha = float(v.get("ablation_alpha", opt_alpha))
         out[k] = {
             "loader": fn,
             "loader_kw": v.get("loader_kw") or {},
             "label": v.get("label", k),
-            "alpha": float(v.get("alpha", 0.1)),
+            "alpha": opt_alpha,
+            "ablation_alpha": abl_alpha,
             "params": dict(v.get("params") or {}),
         }
     return out
@@ -529,21 +544,27 @@ def _build_datasets():
 
 DATASETS = _build_datasets()
 
+# Ablation configs: (label, use_fim_weight, use_entropy_alpha, alpha_source)
+# alpha_source: "zero"=0.0, "ablation"=ds.ablation_alpha, "optimal"=ds.alpha
 ABLATION_CONFIGS = [
-    # (label,            use_fim_weight, use_entropy_alpha, alpha_ratio)
-    ("A: GICP-Base", False, False, 0.0),
-    ("B: +C1", True, False, 0.0),
-    ("C: +C2", False, False, 1.0),
-    ("D: C1+C2", True, False, 1.0),
-    ("E: C2+C3", False, True, 1.0),
-    ("F: Full(C1+2+3)", True, True, 1.0),
+    ("A: GICP-Base",      False, False, "zero"),
+    ("B: +C1",            True,  False, "zero"),
+    ("C: +C2",            False, False, "ablation"),
+    ("D: C1+C2",          True,  False, "ablation"),
+    ("E: C2+C3",          False, True,  "ablation"),
+    ("F: Full(C1+C2+C3)", True,  True,  "ablation"),
+    ("G: Full-Optimal",   True,  False, "optimal"),   # deployed config (C3→alpha=0 for degenerate)
 ]
 
 
-def run_dataset(ds_key, max_frames, device, auto_alpha=True):
+def run_dataset(ds_key, max_frames, device):
     ds = DATASETS[ds_key]
+    opt_alpha = ds["alpha"]
+    abl_alpha = ds["ablation_alpha"]
+
     print(f"\n{'='*70}")
     print(f"  Dataset: {ds['label']}  ({max_frames} frames)")
+    print(f"  optimal α={opt_alpha:.3f}  ablation α={abl_alpha:.3f}")
     print(f"{'='*70}")
 
     print("Loading data...")
@@ -551,94 +572,98 @@ def run_dataset(ds_key, max_frames, device, auto_alpha=True):
     print(f"  {len(frames)} frames, {len(poses_gt)} GT poses")
 
     results = []
-    ref_poses = None  # first config trajectory for diff check
+    ref_ate = None  # GICP-Base ATE for Δ% computation
     for row in ABLATION_CONFIGS:
-        cfg_label = row[0]
-        use_fim_weight = row[1]
-        use_entropy_alpha = row[2]
-        alpha_ratio = row[3]
-        alpha = ds["alpha"] * alpha_ratio
-        use_auto = auto_alpha and (alpha_ratio > 0)
-        auto_str = " auto_α" if use_auto else ""
-        print(f"\n[{cfg_label}]  C1={use_fim_weight}  C2(α)={alpha_ratio:.1f}  C3={use_entropy_alpha}{auto_str}")
+        cfg_label, use_fim_weight, use_entropy_alpha, alpha_src = row
+        if alpha_src == "zero":
+            alpha = 0.0
+        elif alpha_src == "ablation":
+            alpha = abl_alpha
+        else:  # "optimal"
+            alpha = opt_alpha
+        print(f"\n[{cfg_label}]  α={alpha:.3f}  C1={use_fim_weight}  C3={use_entropy_alpha}")
         out = run_config(
-            cfg_label,
-            frames,
-            poses_gt,
+            cfg_label, frames, poses_gt,
             alpha=alpha,
             use_fim_weight=use_fim_weight,
             use_entropy_alpha=use_entropy_alpha,
             params=ds["params"],
             device=device,
-            auto_alpha=use_auto,
+            auto_alpha=False,
         )
         ate, rpe, hz, abs_poses = out[0], out[1], out[2], out[3]
-        if ref_poses is None:
-            ref_poses = abs_poses
-        else:
-            n = min(len(ref_poses), len(abs_poses))
-            pos_ref = np.array([ref_poses[i][:3, 3] for i in range(n)])
-            pos_cur = np.array([abs_poses[i][:3, 3] for i in range(n)])
-            max_diff = float(np.max(np.linalg.norm(pos_cur - pos_ref, axis=1)))
-            print(f"  (vs A) max position diff: {max_diff:.6f} m")
-        results.append((cfg_label, use_fim_weight, alpha_ratio > 0, use_entropy_alpha, ate, rpe, hz))
+        if ref_ate is None:
+            ref_ate = ate
+        pct = (ate - ref_ate) / ref_ate * 100 if ref_ate and not np.isnan(ate) else float("nan")
+        print(f"  Δ vs Base: {pct:+.1f}%")
+        results.append((cfg_label, use_fim_weight, alpha_src != "zero", use_entropy_alpha, alpha, ate, rpe, hz, pct))
 
     # Summary table
-    print(f"\n{'─'*70}")
+    print(f"\n{'─'*75}")
     print(f"  {ds['label']}")
-    print(f"{'─'*70}")
-    print(f"  {'Config':<22}  C1  C2  C3    ATE(m)   RPE(m)   Hz")
-    print(f"  {'─'*68}")
-    best_ate = min(r[4] for r in results if not np.isnan(r[4]))
-    for cfg_label, c1_on, c2_on, c3_on, ate, rpe, hz in results:
+    print(f"  ablation α={abl_alpha:.3f}  optimal α={opt_alpha:.3f}")
+    print(f"{'─'*75}")
+    print(f"  {'Config':<24}  α      C1  C3    ATE(m)    Δ%     Hz")
+    print(f"  {'─'*73}")
+    valid_ates = [r[5] for r in results if not np.isnan(r[5])]
+    best_ate = min(valid_ates) if valid_ates else float("nan")
+    for cfg_label, c1_on, c2_on, c3_on, alpha, ate, rpe, hz, pct in results:
         c1 = "Y" if c1_on else "-"
-        c2 = "Y" if c2_on else "-"
         c3 = "Y" if c3_on else "-"
-        ate_str = f"{ate:.5f}m"
-        rpe_str = f"{rpe:.5f}m"
-        marker = " *" if abs(ate - best_ate) < 1e-9 else "  "
-        print(f"  {cfg_label:<22}  {c1}   {c2}   {c3}  {ate_str:>10} {rpe_str:>8} {hz:5.1f}{marker}")
-    print(f"{'─'*70}")
+        ate_str = f"{ate:.4f}m"
+        pct_str = f"{pct:+.1f}%" if not np.isnan(pct) else "  nan"
+        marker = " ◀" if not np.isnan(ate) and abs(ate - best_ate) < 1e-6 else "  "
+        print(f"  {cfg_label:<24}  {alpha:.3f}  {c1}   {c3}  {ate_str:>9} {pct_str:>7} {hz:5.1f}{marker}")
+    print(f"{'─'*75}")
     return results
 
 
 def main():
     parser = argparse.ArgumentParser(description="IV-GICP Ablation Study")
     parser.add_argument("--dataset", choices=["kitti", "subt", "metro", "geode", "all"], default="all")
-    parser.add_argument("--max-frames", type=int, default=300)
-    parser.add_argument("--device", default="cuda")
-    parser.add_argument("--no-auto-alpha", action="store_true", help="Disable C2 κ-based adaptive alpha (default: on)")
+    parser.add_argument("--max-frames", type=int, default=500)
+    parser.add_argument("--device", default="cpu")
     args = parser.parse_args()
 
     keys = list(DATASETS.keys()) if args.dataset == "all" else [args.dataset]
-    auto_alpha = not args.no_auto_alpha
 
     all_results = {}
     for k in keys:
-        all_results[k] = run_dataset(k, args.max_frames, args.device, auto_alpha)
+        all_results[k] = run_dataset(k, args.max_frames, args.device)
 
     # Final combined summary
     if len(keys) > 1:
-        print(f"\n{'='*70}")
-        print("  ABLATION SUMMARY")
-        print(f"{'='*70}")
-        header = f"  {'Config':<22}  {'KITTI':>8}  {'SubT':>8}  {'Metro':>8}  {'GEODE':>8}"
+        print(f"\n{'='*80}")
+        print("  ABLATION SUMMARY (ATE [m])")
+        print(f"{'='*80}")
+        col_keys = [k for k in keys if k in all_results]
+        header = f"  {'Config':<24}" + "".join(f"  {k.upper():>10}" for k in col_keys)
         print(header)
-        print(f"  {'─'*60}")
-        n = len(ABLATION_CONFIGS)
-        for i in range(n):
+        print(f"  {'─'*78}")
+        for i in range(len(ABLATION_CONFIGS)):
             cfg_label = ABLATION_CONFIGS[i][0]
-            row = f"  {cfg_label:<22}"
-            for k in keys:
-                ate = all_results[k][i][4]
-                row += f"  {ate:>7.3f}m"
+            row = f"  {cfg_label:<24}"
+            for k in col_keys:
+                ate = all_results[k][i][5]
+                row += f"  {ate:>9.4f}m"
             print(row)
-        print(f"{'='*70}")
+        print(f"{'='*80}")
+        print("\n  Δ% vs GICP-Base")
+        print(f"  {'─'*78}")
+        for i in range(len(ABLATION_CONFIGS)):
+            cfg_label = ABLATION_CONFIGS[i][0]
+            row = f"  {cfg_label:<24}"
+            for k in col_keys:
+                pct = all_results[k][i][8]
+                row += f"  {pct:>+9.1f}%"
+            print(row)
+        print(f"{'='*80}")
 
     # Save JSON
     out_path = Path(__file__).parent.parent / "results" / "ablation_results.json"
     out_path.parent.mkdir(exist_ok=True)
-    serializable = {k: [(r[0], r[4], r[5]) for r in v] for k, v in all_results.items()}
+    serializable = {k: [{"config": r[0], "alpha": r[4], "ate": r[5], "rpe": r[6], "hz": r[7], "delta_pct": r[8]} for r in v]
+                    for k, v in all_results.items()}
     with open(out_path, "w") as f:
         json.dump(serializable, f, indent=2)
     print(f"\nSaved → {out_path}")

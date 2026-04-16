@@ -20,7 +20,7 @@ import numpy as np
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-GEODE_ROOT = Path("/home/km/data/GEODE")
+GEODE_ROOT = Path("/home/km/deepai_dev_data/GEODE")
 LIDAR_TOPIC = "/livox/lidar"
 
 

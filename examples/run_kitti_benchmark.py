@@ -11,7 +11,7 @@ Usage:
     # Speed budget vs KISS (mean ms/frame): ≤1.5× preferred, >2× should be avoided.
     # IV-GICP defaults to --device cpu (C++ registration). Use --device cuda only for Python/GPU path (much slower).
 
-Data root assumed: /home/km/data/kitti/dataset
+Data root assumed: /home/km/deepai_dev_data/kitti/dataset
   sequences/XX/velodyne/*.bin   — LiDAR scans
   poses/XX.txt                  — GT poses (camera frame, 3x4 row-major)
 
@@ -31,7 +31,7 @@ import numpy as np
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-KITTI_ROOT   = Path("/home/km/data/kitti/dataset")
+KITTI_ROOT   = Path("/home/km/deepai_dev_data/kitti/dataset")
 GENZ_BINARY  = Path(__file__).parent.parent / "thirdparty/genz-icp/kitti_runner/build/genz_kitti_runner"
 RESULTS_ROOT = Path(__file__).parent.parent / "results" / "kitti"
 

@@ -3,8 +3,8 @@
 HeLiPR Odometry Benchmark: IV-GICP vs KISS-ICP
 
 Sequences available:
-  /home/km/data/HeLiPR/DCC05/   — urban campus (Ouster OS1-64)
-  /home/km/data/HeLiPR/KAIST05/ — campus outdoor (Ouster OS1-64)
+  /home/km/deepai_dev_data/HeLiPR/DCC05/   — urban campus (Ouster OS1-64)
+  /home/km/deepai_dev_data/HeLiPR/KAIST05/ — campus outdoor (Ouster OS1-64)
 
 Point format: 28 bytes/point
   x(f32), y(f32), z(f32), intensity(f32), t(u32), reflectivity(u32), ring(u32)
@@ -26,7 +26,7 @@ import numpy as np
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-HELIPR_ROOT  = Path("/home/km/data/HeLiPR")
+HELIPR_ROOT  = Path("/home/km/deepai_dev_data/HeLiPR")
 RESULTS_ROOT = Path(__file__).parent.parent / "results" / "helipr"
 
 POINT_DTYPE = np.dtype([
