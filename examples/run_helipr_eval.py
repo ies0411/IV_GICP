@@ -197,7 +197,10 @@ def run_kiss_icp(frames, scan_ts, voxel_size=1.0):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--seq",        default="DCC05", choices=["DCC05", "KAIST05"])
+    ap.add_argument("--seq",        default="DCC05",
+                    choices=["DCC04", "DCC05", "DCC06",
+                             "KAIST04", "KAIST05", "KAIST06",
+                             "RIVER04", "RIVER05"])
     ap.add_argument("--max-frames", type=int, default=500)
     ap.add_argument("--device",     default="cpu")
     ap.add_argument("--alpha",      type=float, default=0.0)   # geometry-only: alpha>0 causes degeneracy

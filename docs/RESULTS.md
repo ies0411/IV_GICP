@@ -100,9 +100,14 @@
 | Dataset | IV-GICP   | KISS-ICP  | IV vs KISS | Speed            |
 | ------- | --------- | --------- | ---------- | ---------------- |
 | DCC05   | 0.697     | **0.573** | +21.6%     | **IV faster** (fr300-500 open area) |
+| KAIST04 | **0.214** | 0.215     | **-0.5%**  | **IV faster**    |
 | KAIST05 | **0.403** | 0.626     | **-35.6%** | **IV faster**    |
 
 > Ouster high-density scans (>30k pts): IV-GICP is **1.4–3× faster** than KISS-ICP.
+>
+> **Open-area limitation:** DCC04 (convention center open area) and RIVER04 (riverside) show IV-GICP
+> degradation (+100% / +16%) due to insufficient point density per voxel for reliable covariance
+> estimation. This is expected behavior in flat, featureless outdoor environments.
 
 ---
 
@@ -261,8 +266,10 @@ from sigma collapse in degenerate geometry.
 
 ## 9. Key Claims (Paper)
 
-1. **Outdoor parity:** IV-GICP matches KISS-ICP on KITTI (7/11 wins, avg -1.9%) and SubT (5/5 wins)
-   without any dataset-specific tuning of the core algorithm.
+1. **Outdoor parity:** IV-GICP matches KISS-ICP on KITTI (7/11 wins, avg -1.9%), SubT (5/5 wins),
+   and Ouster campus (KAIST04/05: 2/2 wins) without any dataset-specific tuning of the core algorithm.
+   Open featureless environments (DCC, RIVER) show IV-GICP degradation — known limitation of
+   voxel covariance estimation requiring sufficient neighborhood density.
 
 2. **Tunnel superiority (GEODE Urban):** IV-GICP outperforms KISS-ICP by **-47% to -86%** and
    GenZ-ICP by **-12% to -83%** on GEODE Urban Tunnel (with C1 + corrected params). Ablation
