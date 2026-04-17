@@ -227,16 +227,68 @@ Seven configurations tested per dataset. All use datasets.yaml optimal params (v
 > Base GICP (α=0.0) is optimal for Metro. Forcing α=0.1 (C2) and/or enabling C1 degrades.
 > G=Full-Optimal uses α=0.0 (optimal), C1=True → same as B. GICP-Base (α=0.0, no C1) is best.
 
-### C2 vs C2+C3 Equivalence
+### C2 vs C2+C3 Equivalence (global-alpha C3)
 
 **E (C2+C3) gives identical ATE to C (C2 alone)** across all four datasets to 5 significant figures.
 This is by design: the intensity-variance normalization in C2's precision matrix
 (`σ_I² = vi / vs²`, where `vi` = per-voxel intensity variance) **already implements entropy-adaptive
 alpha weighting**. Voxels with uniform intensity (`vi → 0`) contribute near-zero intensity precision;
-voxels with diverse intensity (`vi` large) contribute proportionally. The `use_entropy_alpha` flag
-(C3) was designed as an additional entropy-scale modulation but is architecturally superseded by C2's
-built-in variance normalization. C3's theoretical contribution is the **information-theoretic
-justification** for why this variance normalization is principled (entropy-consistent α selection).
+voxels with diverse intensity (`vi` large) contribute proportionally. C3's theoretical contribution is
+the **information-theoretic justification** for why this variance normalization is principled.
+
+---
+
+### C3-A: Per-Voxel Adaptive Alpha Gate (2026-04-16 — NEW IMPLEMENTATION)
+
+C3-A is the first real implementation of per-voxel entropy-adaptive alpha, using the geometric
+condition number as a degeneracy proxy. Implemented in `iv_gicp/cpp/iv_gicp_map.cpp`.
+
+**Formula**: `w_v = sigmoid(log(κ_v / κ₀))` applied as `oI *= w_v` (NOT alpha modification).
+- `κ_v = λ_max / λ_min` of **unregularized** voxel covariance (critical: use `M2m/ns + 1e-9·I`, not regularized Sig)
+- `κ₀ = entropy_scale_c = 50.0` (default); degenerate tunnel voxels have `κ_v ≈ 1000–10000`
+- `w_v → 1`: degenerate (C2 fully active), `w_v → 0`: well-conditioned (geometry-only)
+
+**Purpose**: Resolves destructive C1+C2 interference in long sequences. D: C1+C2 fails at 500fr (+41.6%) because:
+1. C1 down-weights degenerate voxels (correct)
+2. C2 adds high-precision intensity to same voxels (uniform concrete → low variance → high ωI)
+3. C3-A suppresses intensity for well-conditioned voxels → no conflict with C1
+
+**500fr ablation (GEODE Urban Tunnel01, kappa0=50.0)** — `examples/ablation_c3a.py` (completed 2026-04-16):
+
+| Config | ATE (m) | vs Base | Note |
+|--------|---------|---------|------|
+| A: Base GICP | 0.9863 | 0.0% | baseline |
+| B: +C1 | **0.7564** | **-23.3%** | C1 alone |
+| C: +C2 (alpha=0.1) | 1.0072 | +2.1% | C2 alone |
+| D: C1+C2 | 1.4977 | **+51.8%** | ← destructive interference confirmed |
+| D': C2+C3-A | 1.0411 | +5.5% | C3-A gating alone |
+| **E': C1+C2+C3-A** | **0.8522** | **-13.6%** | **C3-A resolves conflict** |
+| F: C1 (alpha=0) | **0.7564** | **-23.3%** | same as B, optimal config |
+
+**C3-A improvement over C1+C2: +43.1%** (D=1.4977m → E'=0.8522m).
+
+Key findings:
+- D (+51.8%): destructive interference confirmed at 500fr (worse than the +41.6% from main ablation table)
+- E' (-13.6%): C3-A successfully prevents cascade, achieves positive result
+- Gap vs pure C1 (B=F=-23.3%): residual noise from gated intensity on uniform concrete; κ₀=50 is intermediate
+- D'→E': adding C1 to C2+C3-A gives -15% relative gain, confirming C1 still benefits within C3-A framework
+
+**100fr ablation** (earlier reference results, kappa0=50.0):
+
+| Config | ATE (m) | vs Base |
+|--------|---------|---------|
+| A: Base GICP | 0.1577 | 0.0% |
+| B: +C1 | 0.1490 | -5.5% |
+| D: C1+C2 | 0.1559 | -1.1% (interference not yet catastrophic) |
+| **E': C1+C2+C3-A** | **0.1522** | **-3.5%** |
+| F: C1 (alpha=0) | 0.1490 | -5.5% |
+
+**Implementation key insights**:
+1. **Gate `oI` multiplicatively, never modify alpha** — `oI = (alpha²/(vi/vs²+eps))` then `oI *= w_v`.
+   Modifying alpha causes `oI = alpha²/(vi/vs²+eps) → ∞` as alpha→0 → catastrophic solver divergence.
+2. **Unregularized cov for κ_v** — `Sig = M2m/ns + (1e-6 + ss2 + cr2/n)·I` has `ss2=0.015625` which
+   forces all κ_v ≈ 2-5 regardless of geometry. Use `M2m/ns + 1e-9·I` for discriminative condition numbers.
+3. **Saved results**: `results/geode/Urban_Tunnel01/c3a_ablation.json`
 
 ---
 
@@ -264,7 +316,48 @@ from sigma collapse in degenerate geometry.
 
 ---
 
-## 9. Key Claims (Paper)
+## 9. Hilti SLAM Challenge (Indoor Basement/Corridor)
+
+Evaluated locally using the Hilti eval kit GT (sparse prism/pole-tip measurements).
+Online submission not available (challenge closed).
+
+### Sequences
+| Sequence | Sensor | Frames | Path |
+|----------|--------|--------|------|
+| exp07_long_corridor (2022) | Hesai Pandar64, ~47k pts/fr | 1322 | 138 m |
+| Basement_1 (2021) | Ouster OS1-64, ~90k pts/fr | 1130 | 70 m |
+
+### 3-Way Comparison (IV-GICP vs KISS-ICP vs GenZ-ICP, local GT, 2026-04-17)
+
+IV-GICP params: `α=0.5, voxel=0.3, mc=0.5, R=40m, itr=20` (exp07); `α=0.1` (Basement_1).
+All methods: `voxel=0.3, max_range=40m, min_range=0.5m`.
+
+| Sequence | IV-GICP | KISS-ICP | GenZ-ICP | IV vs KISS | Notes |
+|----------|---------|---------|---------|-----------|-------|
+| exp07_long_corridor | 1.14 m | **0.80 m** | 11.26 m | +43% | GenZ diverges (corridor axis) |
+| Basement_1 | 18.6 cm | **16.8 cm** | 19.1 cm | +11% | All three competitive |
+
+> **GT**: sparse prism measurements (6 pts for exp07, 5 pts for Basement_1).
+> Evaluation applies IMU→prism pole-tip calibration (5.9cm, -0.86cm, 19.6cm offset) per
+> the official Hilti eval script, followed by Umeyama alignment + APE.
+
+**Key findings:**
+- **KISS-ICP wins** both sequences by small-to-moderate margins (11–43%)
+- **GenZ-ICP diverges** on exp07 long corridor (11.26m vs 0.80m): planarity-based mode
+  switching fails in the degenerate corridor-axis environment; path = 324m vs actual 138m
+- **GenZ-ICP is competitive** in Basement_1 (19.1cm vs IV 18.6cm vs KISS 16.8cm)
+- **IV-GICP** is consistently between KISS and GenZ; no catastrophic failures
+
+**Params note:**
+- `use_fim_weight=False` for all Hilti sequences — C1 causes path explosion on dense sensors
+  (47k–90k pts/fr) in uniform corridors
+- Basement_3 and exp14/exp18 have no local GT; trajectory consistency verified via path length
+
+Submission ZIPs: `results/hilti/submission_2021.zip`, `results/hilti/submission_2022.zip`
+
+---
+
+## 10. Key Claims (Paper)
 
 1. **Outdoor parity:** IV-GICP matches KISS-ICP on KITTI (7/11 wins, avg -1.9%), SubT (5/5 wins),
    and Ouster campus (KAIST04/05: 2/2 wins) without any dataset-specific tuning of the core algorithm.
