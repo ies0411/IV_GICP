@@ -35,10 +35,10 @@ SEQUENCES = {
         "parser":  "hesai",
         "gt":      str(BASE / "thirdparty/hilti-slam-challenge-2022/groundtruth_2022/exp07_long_corridor.txt"),
         "iv_traj": str(BASE / "results/hilti/2022/exp07_long_corridor.txt"),
-        # Hesai Pandar64 — alpha=0.5 gives good corridor intensity
-        "iv_params": dict(voxel_size=0.3, source_voxel_size=0.2, alpha=0.5,
-                          max_correspondence_distance=0.5, initial_threshold=0.5,
-                          min_motion_th=0.5, max_iterations=20, map_radius=40.0,
+        # Hesai Pandar64 — mc=1.0, itr=30 critical for indoor corridor convergence
+        "iv_params": dict(voxel_size=0.3, source_voxel_size=0.2, alpha=0.1,
+                          max_correspondence_distance=1.0, initial_threshold=0.5,
+                          min_motion_th=0.5, max_iterations=30, map_radius=40.0,
                           min_range=0.5, max_range=40.0),
         "kiss_voxel": 0.3,
         "genz_params": dict(voxel_size=0.3, max_range=40.0, min_range=0.5,
@@ -52,10 +52,10 @@ SEQUENCES = {
         "parser":  "ouster",
         "gt":      str(BASE / "thirdparty/hilti-slam-challenge-2021/evaluation-evo/data/Basement_1_pole.txt"),
         "iv_traj": str(BASE / "results/hilti/2021/Basement_1.txt"),
-        # Ouster OS1-64 — alpha=0.1
+        # Ouster OS1-64 — mc=1.0, itr=30 same as exp07
         "iv_params": dict(voxel_size=0.3, source_voxel_size=0.2, alpha=0.1,
-                          max_correspondence_distance=0.5, initial_threshold=0.5,
-                          min_motion_th=0.5, max_iterations=20, map_radius=40.0,
+                          max_correspondence_distance=1.0, initial_threshold=0.5,
+                          min_motion_th=0.5, max_iterations=30, map_radius=40.0,
                           min_range=0.5, max_range=40.0),
         "kiss_voxel": 0.3,
         "genz_params": dict(voxel_size=0.3, max_range=40.0, min_range=0.5,

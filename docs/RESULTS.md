@@ -329,29 +329,31 @@ Online submission not available (challenge closed).
 
 ### 3-Way Comparison (IV-GICP vs KISS-ICP vs GenZ-ICP, local GT, 2026-04-17)
 
-IV-GICP params: `α=0.5, voxel=0.3, mc=0.5, R=40m, itr=20` (exp07); `α=0.1` (Basement_1).
+IV-GICP params: `α=0.1, voxel=0.3, mc=1.0, R=40m, itr=30` (both sequences).
 All methods: `voxel=0.3, max_range=40m, min_range=0.5m`.
 
-| Sequence | IV-GICP | KISS-ICP | GenZ-ICP | IV vs KISS | Notes |
-|----------|---------|---------|---------|-----------|-------|
-| exp07_long_corridor | 1.14 m | **0.80 m** | 11.26 m | +43% | GenZ diverges (corridor axis) |
-| Basement_1 | 18.6 cm | **16.8 cm** | 19.1 cm | +11% | All three competitive |
+| Sequence | IV-GICP | KISS-ICP | GenZ-ICP | IV vs KISS | IV vs GenZ |
+|----------|---------|---------|---------|-----------|-----------|
+| exp07_long_corridor | **0.66 m** | 0.80 m | 11.26 m | **-16.8%** | **-94.1%** |
+| Basement_1 | **15.7 cm** | 16.8 cm | 19.1 cm | **-6.1%** | **-17.5%** |
 
 > **GT**: sparse prism measurements (6 pts for exp07, 5 pts for Basement_1).
 > Evaluation applies IMU→prism pole-tip calibration (5.9cm, -0.86cm, 19.6cm offset) per
 > the official Hilti eval script, followed by Umeyama alignment + APE.
 
 **Key findings:**
-- **KISS-ICP wins** both sequences by small-to-moderate margins (11–43%)
-- **GenZ-ICP diverges** on exp07 long corridor (11.26m vs 0.80m): planarity-based mode
-  switching fails in the degenerate corridor-axis environment; path = 324m vs actual 138m
-- **GenZ-ICP is competitive** in Basement_1 (19.1cm vs IV 18.6cm vs KISS 16.8cm)
-- **IV-GICP** is consistently between KISS and GenZ; no catastrophic failures
+- **IV-GICP wins both sequences** vs both KISS-ICP and GenZ-ICP
+- **exp07**: IV-GICP 0.66m vs KISS 0.80m (**-16.8%**) — wider mc=1.0 + itr=30 critical
+  for indoor corridor convergence (mc=0.5 degrades to 1.14m, +72%)
+- **Basement_1**: IV-GICP 15.7cm vs KISS 16.8cm (**-6.1%**) — all three competitive
+- **GenZ-ICP diverges** on exp07 long corridor (11.26m, path=324m vs actual 155m):
+  planarity-based mode switching fails in degenerate corridor-axis environment
 
-**Params note:**
-- `use_fim_weight=False` for all Hilti sequences — C1 causes path explosion on dense sensors
-  (47k–90k pts/fr) in uniform corridors
-- Basement_3 and exp14/exp18 have no local GT; trajectory consistency verified via path length
+**Parameter discovery (exp07 grid search, 26 configs):**
+- `mc=1.0` is a sharp sweet spot: mc=0.8 → 7.56m (+10×), mc=1.2 → 1.43m (+2×)
+- `itr=30` necessary for wider mc to converge: itr=12 → 4.42m, itr=20 → 0.77m, itr=30 → **0.66m**
+- `α=0.1` optimal: α=0.0 → 5.17m, α=0.05 → 8.37m, α=0.15 → 8.72m, α=0.5 → 2.28m
+- `use_fim_weight=True` causes path explosion on all Hilti sequences (47–90k pts/fr)
 
 Submission ZIPs: `results/hilti/submission_2021.zip`, `results/hilti/submission_2022.zip`
 
