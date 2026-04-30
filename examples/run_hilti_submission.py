@@ -43,6 +43,8 @@ DATASETS = {
             "exp14_basement_2",
             "exp18_corridor_lower_gallery_2",
         ],
+        # Ouster OS1-64: alpha=0.1 (Ouster indoor less reliable than Hesai for intensity)
+        "params_override": {"alpha": 0.1},
     },
     "2022": {
         "base": "/home/km/deepai_dev_data/hilti/2022",
@@ -53,14 +55,17 @@ DATASETS = {
             "exp14_basement_2",
             "exp18_corridor_lower_gallery_2",
         ],
+        "params_override": {},  # use default IV_GICP_PARAMS
     },
 }
 
-# Best params from CLAUDE.md (Hilti corridor: tight indoor, degenerate corridors)
+# Best params for Hilti (indoor basement/corridor: geometric degeneracy, slow-moving robot)
+# Note: use_fim_weight=True caused path explosion on Hesai Pandar64 (2681m vs expected ~140m).
+# Original working params (March 2022 run: 138.7m path for exp07) used alpha=0.5, no fim_weight.
 IV_GICP_PARAMS = dict(
     voxel_size=0.3,
     source_voxel_size=0.2,
-    alpha=0.5,                         # intensity important in degenerate corridor
+    alpha=0.5,                         # higher alpha: intensity critical in degenerate corridor
     max_correspondence_distance=0.5,   # tight: slow indoor robot
     initial_threshold=0.5,
     min_motion_th=0.5,                 # sigma floor: prevents cascade failure in corridor
@@ -116,10 +121,8 @@ def read_bag(bag_path: str, topic: str, parser_name: str, max_frames: int = None
     parse_fn  = PARSERS[parser_name]
 
     frames = []
-    print(f"  Reading: {Path(bag_path).name}")
+    print(f"  Reading: {Path(bag_path).name}", flush=True)
     with Reader(bag_path) as bag:
-        conns = [c for c in bag.connections if c.topic == topic]
-        total = sum(1 for _ in bag.messages(connections=conns))
         conns = [c for c in bag.connections if c.topic == topic]
         for conn, ts_ns, raw in bag.messages(connections=conns):
             msg = typestore.deserialize_ros1(raw, conn.msgtype)
@@ -127,7 +130,7 @@ def read_bag(bag_path: str, topic: str, parser_name: str, max_frames: int = None
             if pts is not None and len(pts) > 200:
                 frames.append((ts_ns / 1e9, pts))
                 if len(frames) % 200 == 0:
-                    print(f"  {len(frames)}/{total} frames loaded ...", end="\r")
+                    print(f"  {len(frames)} frames loaded ...", end="\r", flush=True)
                 if max_frames and len(frames) >= max_frames:
                     break
     dur = frames[-1][0] - frames[0][0] if len(frames) > 1 else 0.0
@@ -138,16 +141,17 @@ def read_bag(bag_path: str, topic: str, parser_name: str, max_frames: int = None
 
 # ── IV-GICP runner ─────────────────────────────────────────────────────────────
 
-def run_iv_gicp(frames, device="cuda"):
+def run_iv_gicp(frames, device="cuda", params_override=None):
     import sys; sys.path.insert(0, str(Path(__file__).parent.parent))
     from iv_gicp.pipeline import IVGICPPipeline
 
-    pipeline = IVGICPPipeline(device=device, **IV_GICP_PARAMS)
+    params = {**IV_GICP_PARAMS, **(params_override or {})}
+    pipeline = IVGICPPipeline(device=device, **params)
 
     abs_poses = [np.eye(4)]
     times = []
     n = len(frames)
-    print(f"  [IV-GICP] {n} frames, device={device}, map_radius={IV_GICP_PARAMS['map_radius']}m")
+    print(f"  [IV-GICP] {n} frames, device={device}, alpha={params['alpha']}, map_radius={params['map_radius']}m")
 
     for i, (ts, pts) in enumerate(frames):
         t0 = time.perf_counter()
@@ -156,7 +160,7 @@ def run_iv_gicp(frames, device="cuda"):
         abs_poses.append(result.pose.copy())
         times.append(elapsed)
         if i % 100 == 0 or i == n - 1:
-            print(f"  {i+1:4d}/{n}  {elapsed:6.1f}ms", end="\r")
+            print(f"  {i+1:4d}/{n}  {elapsed:6.1f}ms", end="\r", flush=True)
 
     times = np.array(times[1:])  # skip first frame
     print(f"\n  mean={times.mean():.1f}ms  median={np.median(times):.1f}ms  "
@@ -237,7 +241,7 @@ def main():
             frames = read_bag(bag_path, cfg["lidar_topic"], cfg["parser"], args.max_frames)
             timestamps = [f[0] for f in frames]
 
-            poses = run_iv_gicp(frames, device=device)
+            poses = run_iv_gicp(frames, device=device, params_override=cfg.get("params_override", {}))
 
             # Save submission file
             sub_path = out_dir / f"{seq}.txt"

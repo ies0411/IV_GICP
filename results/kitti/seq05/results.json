@@ -4,33 +4,29 @@
   "iv_sparse_mode": null,
   "methods": {
     "KISS-ICP": {
-      "ate_rmse": 0.3801408010973613,
-      "ate_mean": 0.3456573243102024,
+      "ate_rmse": 0.3801408010973803,
+      "ate_mean": 0.3456573243102283,
       "kitti_t_err": 111.91693870321495,
-      "mean_ms": 230.6876837927848,
+      "mean_ms": 632.4780171476305,
       "n_frames": 500,
       "device": "cpu"
     },
     "IV-GICP": {
-      "ate_rmse": 0.3510162821402525,
-      "ate_mean": 0.3169006338100628,
-      "kitti_t_err": 111.83569143497098,
-      "mean_ms": 207.30669757926123,
+      "ate_rmse": 0.3510162821402901,
+      "ate_mean": 0.3169006338096168,
+      "kitti_t_err": 111.83569143497297,
+      "mean_ms": 722.5958747221885,
       "n_frames": 500,
       "device": "cpu",
-      "reg_ms": 91.12697921297654,
-      "map_ms": 70.7228482936048,
+      "reg_ms": 455.7655278485052,
+      "map_ms": 189.84473279989015,
       "sparse_mode": null
-    },
-    "GenZ-ICP": {
-      "ate_rmse": 0.3245004478529249,
-      "n_frames": 500
     }
   },
   "speed_vs_kiss": {
-    "kiss_mean_ms": 230.90638381285305,
-    "iv_mean_ms": 207.30669757926123,
-    "ratio_iv_over_kiss": 0.8977954362114168,
+    "kiss_mean_ms": 633.3448960742576,
+    "iv_mean_ms": 722.5958747221885,
+    "ratio_iv_over_kiss": 1.1409200250939837,
     "target_ratio_max": 1.5,
     "hard_cap_ratio": 2.0,
     "within_soft_budget": true,

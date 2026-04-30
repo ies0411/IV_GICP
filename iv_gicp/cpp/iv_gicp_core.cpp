@@ -270,6 +270,8 @@ struct GNResult {
     int iter = 0;
     bool converged = false;
     double gn_loop_ms = 0.0;  // profiling: total time inside GN iteration loop
+    double gap_ratio_last = -1.0;  // eigenvalue gap ratio at final GN iteration (-1 = not computed)
+    int c1_active_iters = 0;       // number of GN iterations where C1 was activated
 };
 
 static void run_gn_loop(
@@ -295,7 +297,8 @@ static void run_gn_loop(
     bool use_mscs,          // C4: MSCS — stop when λ_min(H) ≥ λ_max/mscs_kappa_max
     double mscs_kappa_max,  // target condition number for MSCS stopping criterion
     const Vector6d& v_min_prev,  // warm-start min eigenvector from previous frame (for non-FIM path)
-    GNResult& out
+    GNResult& out,
+    double fim_auto_gate = 0.0  // C1 auto-gate: disable FIM weight when κ_H = λ_max/λ_min < threshold (0=manual)
 ) {
     (void)N;
     using Mat36 = Eigen::Matrix<double, 3, 6>;
@@ -469,6 +472,40 @@ static void run_gn_loop(
             }
 
             Eigen::SelfAdjointEigenSolver<Matrix6d> es(I_G);
+
+            // C1 auto-gate: eigenvalue gap ratio (λ₂-λ₁)/λ₂ based.
+            // Tunnel degeneracy: λ₁ ≈ λ₂ → gap_ratio ≈ 0 → C1 needed.
+            // Well-conditioned: λ₂ > λ₁ → gap_ratio > 0 → C1 off.
+            // fim_auto_gate=0 → manual mode (use_fim_weight decides).
+            // fim_auto_gate>0 → threshold: C1 active when gap_ratio < fim_auto_gate.
+            bool do_fim_weight = true;
+            if (fim_auto_gate > 0.0 && n_valid > 0) {
+                double lam1 = std::max(es.eigenvalues()[0], 1e-12);  // smallest
+                double lam2 = std::max(es.eigenvalues()[1], 1e-12);  // 2nd smallest
+                double gap_ratio = (lam2 - lam1) / lam2;  // 0 = degenerate, 1 = well-conditioned
+                out.gap_ratio_last = gap_ratio;
+                do_fim_weight = (gap_ratio < fim_auto_gate);
+                if (do_fim_weight) out.c1_active_iters++;
+            }
+
+            if (!do_fim_weight) {
+                // Well-conditioned geometry: use uniform Huber weights (same as non-FIM path)
+                HbPair Hb;
+                #pragma omp parallel for reduction(merge_Hb : Hb)
+                for (int m = 0; m < n_valid; ++m) {
+                    double w = valid_w_huber[m];
+                    if (alpha_geo_only) {
+                        Hb.H += w * valid_J_xyz[m].transpose() * valid_Og[m] * valid_J_xyz[m];
+                        Hb.b += w * valid_J_xyz[m].transpose() * valid_Og[m] * valid_d_3d[m];
+                    } else {
+                        Eigen::Matrix<double, 6, 4> JtO = w * valid_J[m].transpose() * valid_Omega[m];
+                        Hb.H += JtO * valid_J[m];
+                        Hb.b += JtO * valid_d[m];
+                    }
+                }
+                H = Hb.H; b = Hb.b;
+            } else {
+
             Vector6d v = es.eigenvectors().col(0);
             double sum_w_fim = 0.0;
             std::vector<double> w_fim(n_valid, 1.0);
@@ -543,6 +580,7 @@ static void run_gn_loop(
                 H = Hb.H;
                 b = Hb.b;
             }
+            } // end do_fim_weight else
         } else if (use_mscs) {
             // C4 MSCS non-FIM path: two-pass — collect all Jacobians, then sort+greedy.
             // Uses v_min_prev (previous frame's min eigenvector) as warm-start direction.
@@ -803,7 +841,8 @@ public:
         double trim_ratio = 0.0,
         bool use_mscs = false,
         double mscs_kappa_max = 100.0,
-        py::array_t<double, py::array::c_style | py::array::forcecast> v_min_prev_arr = py::array_t<double>(6)
+        py::array_t<double, py::array::c_style | py::array::forcecast> v_min_prev_arr = py::array_t<double>(6),
+        double fim_auto_gate = 0.0
     ) {
         auto src_xyz_buf  = src_xyz_arr.request();
         auto src_int_buf  = src_int_arr.request();
@@ -832,7 +871,7 @@ public:
         run_gn_loop(*tree_, N_, M, tgt_m, tgt_p, tgt_g, src_xyz, src_int,
                     T_init, max_dist_sq, alpha, max_iter, huber_delta, min_valid, use_fim_weight,
                     max_source_points, gm_scale, fim_gate_ratio, trim_ratio,
-                    use_mscs, mscs_kappa_max, v_prev, gr);
+                    use_mscs, mscs_kappa_max, v_prev, gr, fim_auto_gate);
 
         auto T_out = py::array_t<double>({4, 4});
         auto H_out = py::array_t<double>({6, 6});
@@ -855,6 +894,8 @@ public:
         result["converged"]     = gr.converged;
         result["tree_build_ms"] = 0.0;  // reused session, no tree build
         result["gn_loop_ms"]    = gr.gn_loop_ms;
+        result["gap_ratio"]     = gr.gap_ratio_last;
+        result["c1_active_iters"] = gr.c1_active_iters;
         return result;
     }
 
@@ -892,7 +933,8 @@ py::dict icp_register(
     double trim_ratio = 0.0,
     bool use_mscs = false,
     double mscs_kappa_max = 100.0,
-    py::array_t<double, py::array::c_style | py::array::forcecast> v_min_prev_arr = py::array_t<double>(6)
+    py::array_t<double, py::array::c_style | py::array::forcecast> v_min_prev_arr = py::array_t<double>(6),
+    double fim_auto_gate = 0.0
 ) {
     // ── Validate + map numpy buffers ─────────────────────────────────────────
     auto src_xyz_buf  = src_xyz_arr.request();
@@ -936,7 +978,7 @@ py::dict icp_register(
     run_gn_loop(tree, N, M, tgt_m, tgt_p, tgt_g, src_xyz, src_int,
                 T, max_dist_sq, alpha, max_iter, huber_delta, min_valid, use_fim_weight,
                 max_source_points, gm_scale, fim_gate_ratio, trim_ratio,
-                use_mscs, mscs_kappa_max, v_prev, gr);
+                use_mscs, mscs_kappa_max, v_prev, gr, fim_auto_gate);
 
     // ── Pack result as numpy arrays ──────────────────────────────────────────
     auto T_out = py::array_t<double>({4, 4});
@@ -960,6 +1002,8 @@ py::dict icp_register(
     result["converged"]     = gr.converged;
     result["tree_build_ms"] = tree_build_ms;
     result["gn_loop_ms"]    = gr.gn_loop_ms;
+    result["gap_ratio"]     = gr.gap_ratio_last;
+    result["c1_active_iters"] = gr.c1_active_iters;
     return result;
 }
 
@@ -1126,6 +1170,7 @@ PYBIND11_MODULE(iv_gicp_core, m) {
              py::arg("use_mscs") = false,
              py::arg("mscs_kappa_max") = 100.0,
              py::arg("v_min_prev") = py::array_t<double>(6),
+             py::arg("fim_auto_gate") = 0.0,
              "Register using cached KDTree. Returns dict with T, H, v_min, n_valid, n_mscs_used, iterations, converged, tree_build_ms, gn_loop_ms.");
 
     m.def("icp_register", &icp_register,
@@ -1145,6 +1190,7 @@ PYBIND11_MODULE(iv_gicp_core, m) {
         py::arg("use_mscs") = false,
         py::arg("mscs_kappa_max") = 100.0,
         py::arg("v_min_prev") = py::array_t<double>(6),
+        py::arg("fim_auto_gate") = 0.0,
         R"doc(
 Full IV-GICP Gauss-Newton registration loop in C++/Eigen.
 

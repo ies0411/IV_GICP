@@ -359,12 +359,21 @@ public:
      */
     py::dict build_target_arrays(double alpha, double source_sigma,
                                  int k_grad_nbrs, double count_reg_scale,
-                                 bool use_entropy_alpha = false, double entropy_scale_c = 0.3,
+                                 bool use_entropy_alpha = false, double entropy_scale_c = 50.0,
                                  int stable_frames = 0,  // TSG: voxels with n_frames < stable_frames get isotropic blend
-                                 int max_target_voxels = 0)  // >0: LOAM-style cap — keep top-K by observation count n
+                                 int max_target_voxels = 0)  // >0: C3-B FIM-guided cap — keep top-K by FIM proxy n/tr(Σ)
     {
-        (void)use_entropy_alpha;
-        (void)entropy_scale_c;
+        // C3-A (use_entropy_alpha): per-voxel adaptive alpha
+        //   alpha_v = alpha * sigmoid(log(κ_v / κ₀))
+        //   κ_v = condition number of geometric covariance (λ_max/λ_min)
+        //   κ₀  = entropy_scale_c (default 50.0)
+        //   Degenerate voxels (κ_v >> κ₀) → alpha_v ≈ alpha (full intensity)
+        //   Well-conditioned voxels (κ_v << κ₀) → alpha_v ≈ 0 (geometry-only)
+        //   Resolves C1+C2 destructive interference: intensity added only where geometry fails.
+        //
+        // C3-B (max_target_voxels>0): FIM-guided target voxel selection
+        //   Ranks voxels by n/tr(Σ) instead of count n.
+        //   High FIM proxy = many observations in tight distribution = high constraint.
         const double eps=1e-6, eps_var=1e-4;
         const double vs2=vs_*vs_, ss2=source_sigma*source_sigma;
         const double cr2=count_reg_scale*count_reg_scale, a2=alpha*alpha;
@@ -375,11 +384,19 @@ public:
         valid.reserve(voxels_.size());
         for(auto& kv:voxels_) if(kv.second.n>=min_pts_) valid.push_back(&kv.second);
 
-        // 1b. Optional cap: keep voxels with largest n (strongest statistics) for registration + KD only.
-        // Full map insert/eviction unchanged; this only affects the target arrays used by GN.
+        // 1b. C3-B: FIM-guided voxel selection cap.
+        // Ranks voxels by FIM proxy = n / tr(Σ_geo) instead of count n.
+        // Full map insert/eviction unchanged; only affects GN registration target.
+        // High FIM proxy: many observations + tight covariance = high information.
         if (max_target_voxels > 0 && (int)valid.size() > max_target_voxels) {
             std::nth_element(valid.begin(), valid.begin() + max_target_voxels, valid.end(),
-                [](const VoxelState* a, const VoxelState* b) { return a->n > b->n; });
+                [](const VoxelState* a, const VoxelState* b) {
+                    int nsa = std::max(a->n - 1, 1);
+                    int nsb = std::max(b->n - 1, 1);
+                    double tra = (a->M2[0]+a->M2[4]+a->M2[8]) / nsa + 1e-6;
+                    double trb = (b->M2[0]+b->M2[4]+b->M2[8]) / nsb + 1e-6;
+                    return (double)a->n / tra > (double)b->n / trb;  // FIM proxy descending
+                });
             valid.resize((size_t)max_target_voxels);
         }
 
@@ -426,11 +443,38 @@ public:
 
             double vi=s.M2_i*inv;
             double gp=vi/(vs2+1e-9);
-            double sq=std::min(std::max(a2/(gp+eps_var),1e-6),1e6);
-            double oI=1.0/(sq+eps);
+
+            // C2: intensity precision (variance-normalized, alpha-scaled)
+            // oI = vi / (alpha² × vs²) = "more weight when intensity varies more"
+            double sq  = std::min(std::max(a2/(gp+eps_var), 1e-6), 1e6);
+            double oI  = 1.0 / (sq + eps);
+            double m4_i = alpha * s.mean_i;  // target 4D mean: keep global alpha
+
+            // C3-A: per-voxel intensity gate w_v = sigmoid(log(κ_v / κ₀))
+            // Uses UNREGULARIZED covariance eigenvalues (more discriminative than Sig).
+            //   κ_v = λ_max/λ_min of M2_raw/ns + 1e-9·I  (pure geometry)
+            //   κ₀  = entropy_scale_c (default 50.0)
+            //   κ_v >> κ₀  (degenerate voxel)     → w_v ≈ 1 → full C2 intensity weight
+            //   κ_v << κ₀  (well-conditioned)       → w_v ≈ 0 → suppress intensity
+            //
+            // Critical: ONLY multiply oI by w_v; keep m4_i = alpha * mean_I unchanged.
+            // This preserves source/target residual r4 = alpha*(I_src - mean_I) and
+            // avoids the divergence bug (oI → ∞ when per-voxel alpha → 0).
+            // Effect: for well-conditioned voxels oI→0 (no intensity), for degenerate
+            // voxels oI stays at C2 value (full intensity). Resolves C1+C2 interference.
+            if (use_entropy_alpha && alpha > 1e-12) {
+                Matrix3d cov_raw = M2m*inv + 1e-9*I3;  // minimal reg, not Sig
+                Eigen::SelfAdjointEigenSolver<Matrix3d> es(cov_raw, Eigen::EigenvaluesOnly);
+                double lmin = std::max(es.eigenvalues()[0], 1e-12);
+                double lmax = std::max(es.eigenvalues()[2], 1e-12);
+                double kv   = lmax / lmin;
+                double k0   = std::max(entropy_scale_c, 1.0);
+                double w_v  = 1.0 / (1.0 + std::exp(std::log(k0) - std::log(kv)));
+                oI *= w_v;  // gate: near-zero for conditioned, full for degenerate
+            }
 
             m4[i*4+0]=s.mean[0]; m4[i*4+1]=s.mean[1];
-            m4[i*4+2]=s.mean[2]; m4[i*4+3]=alpha*s.mean_i;
+            m4[i*4+2]=s.mean[2]; m4[i*4+3]=m4_i;
             m3[i*3+0]=s.mean[0]; m3[i*3+1]=s.mean[1]; m3[i*3+2]=s.mean[2];
 
             double* p=pr+i*16;
@@ -543,6 +587,69 @@ public:
             if (k > max_k) max_k = k;
         }
         return max_k;
+    }
+
+    /**
+     * Normal scatter condition number κ_N: measures how well voxel normals
+     * span 3D space.
+     *   - Tunnel: normals radial → span a plane → κ_N large (degenerate)
+     *   - Outdoor: normals span 3D → κ_N small (well-conditioned)
+     *
+     * Computes: N = Σ n_i n_i^T (3×3), κ_N = λ_max(N) / λ_min(N)
+     * where n_i = smallest eigenvector of voxel covariance (the surface normal).
+     * Returns (κ_N, gap_ratio_N) where gap_ratio_N = (λ₂_N - λ₁_N) / λ₂_N.
+     */
+    /**
+     * get_mean_intensity_variance: average per-voxel intensity variance.
+     * Returns (mean_var, n_voxels) for auto-alpha mode detection.
+     * Low mean_var → uniform surface (concrete tunnel) → alpha=0, C1=on
+     * High mean_var → diverse materials (outdoor) → alpha>0, C1=off
+     */
+    std::pair<double, int> get_mean_intensity_variance() const {
+        double sum_var = 0.0;
+        int n_voxels = 0;
+        for (const auto& kv : voxels_) {
+            const VoxelState& s = kv.second;
+            if (s.n < min_pts_) continue;
+            int ns = std::max(s.n - 1, 1);
+            double var_i = s.M2_i / ns;  // intensity variance
+            sum_var += var_i;
+            ++n_voxels;
+        }
+        if (n_voxels == 0) return {0.0, 0};
+        return {sum_var / n_voxels, n_voxels};
+    }
+
+    std::pair<double, double> get_normal_scatter_kappa() const {
+        const double reg = 1e-6;
+        const Matrix3d I3 = Matrix3d::Identity();
+        Matrix3d N = Matrix3d::Zero();
+        int n_voxels = 0;
+
+        for (const auto& kv : voxels_) {
+            const VoxelState& s = kv.second;
+            if (s.n < min_pts_) continue;
+            int ns = std::max(s.n - 1, 1);
+            Eigen::Map<const Eigen::Matrix<double,3,3,Eigen::RowMajor>> M2m(s.M2);
+            Matrix3d Sig = M2m / ns + reg * I3;
+            Eigen::SelfAdjointEigenSolver<Matrix3d> es(Sig);
+            // Normal = eigenvector with smallest eigenvalue
+            Eigen::Vector3d n_vec = es.eigenvectors().col(0);
+            N += n_vec * n_vec.transpose();
+            ++n_voxels;
+        }
+
+        if (n_voxels < 3) return {1.0, 0.0};
+
+        Eigen::SelfAdjointEigenSolver<Matrix3d> es_N(N);
+        const auto& ev = es_N.eigenvalues();
+        double lam1 = std::max(ev[0], 1e-12);  // smallest
+        double lam2 = std::max(ev[1], 1e-12);
+        double lam3 = std::max(ev[2], 1e-12);  // largest
+
+        double kappa_N = lam3 / lam1;
+        double gap_ratio_N = (lam2 - lam1) / std::max(lam2, 1e-12);
+        return {kappa_N, gap_ratio_N};
     }
 
 private:
@@ -907,14 +1014,26 @@ PYBIND11_MODULE(iv_gicp_map, m) {
         .def("build_target_arrays", &VoxelMap::build_target_arrays,
              py::arg("alpha"), py::arg("source_sigma")=0.0,
              py::arg("k_grad_nbrs")=8, py::arg("count_reg_scale")=2.0,
-             py::arg("use_entropy_alpha")=false, py::arg("entropy_scale_c")=0.5,
+             py::arg("use_entropy_alpha")=false, py::arg("entropy_scale_c")=50.0,
              py::arg("stable_frames")=0,
              py::arg("max_target_voxels")=0,
-             "If max_target_voxels>0, use at most that many voxels for registration/KD (ranked by point count n). "
+             "C3-A (use_entropy_alpha=True): per-voxel adaptive alpha = alpha * sigmoid(log(kv/k0)), "
+             "kv=cond(Sig_geo), k0=entropy_scale_c (default 50.0). Degenerate voxels get full alpha; "
+             "well-conditioned voxels get near-zero alpha. Resolves C1+C2 interference. "
+             "C3-B (max_target_voxels>0): FIM-guided selection ranked by n/tr(Sigma) instead of count n. "
              "0 = use all valid voxels (default). Map storage is unchanged.")
         .def("query_sigma",         &VoxelMap::query_sigma,
              py::arg("pts_world"), py::arg("max_dist"), py::arg("min_threshold")=0.1)
         .def("get_max_condition_number", &VoxelMap::get_max_condition_number)
+        .def("get_mean_intensity_variance", [](const VoxelMap& self) {
+            auto [mean_var, n_voxels] = self.get_mean_intensity_variance();
+            return py::make_tuple(mean_var, n_voxels);
+        }, "Mean per-voxel intensity variance: (mean_var, n_voxels). "
+           "Low → uniform surface (alpha=0), High → diverse materials (alpha>0).")
+        .def("get_normal_scatter_kappa", [](const VoxelMap& self) {
+            auto [kappa, gap] = self.get_normal_scatter_kappa();
+            return py::make_tuple(kappa, gap);
+        }, "Normal scatter κ_N: (κ_N, gap_ratio_N). Large κ_N = tunnel, small = outdoor.")
         .def("size",   &VoxelMap::size)
         .def("__len__",&VoxelMap::size);
 

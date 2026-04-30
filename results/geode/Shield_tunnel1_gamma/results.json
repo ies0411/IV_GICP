@@ -1,7 +1,7 @@
 {
   "meta": {
     "seq": "Shield_tunnel1_gamma",
-    "bag": "/home/km/data/GEODE/sensor_data/Metro_tunnel/Shield_tunnel1_gamma/Shield_tunnel1_gamma.bag",
+    "bag": "/home/km/deepai_dev_data/GEODE/sensor_data/Metro_tunnel/Shield_tunnel1_gamma/Shield_tunnel1_gamma.bag",
     "n_frames": 500,
     "duration_s": 49.89989113807678,
     "avg_pts_per_frame": 23702.44,
@@ -10,21 +10,21 @@
   },
   "methods": {
     "KISS-ICP": {
-      "mean_ms": 60.32877901662141,
-      "hz": 16.57583687752882,
-      "path_length_m": 70.45400905920978,
-      "end_displacement_m": 4.418628715550738,
+      "mean_ms": 815.6009615398943,
+      "hz": 1.2260897757059424,
+      "path_length_m": 70.45400905920974,
+      "end_displacement_m": 4.41862871555074,
       "ate_rmse_m": 17.616965534499858,
       "n_frames": 500
     },
     "IV-GICP": {
-      "mean_ms": 23.317260026580882,
-      "hz": 42.88668560800171,
-      "path_length_m": 74.3648593759892,
-      "end_displacement_m": 6.079446701788454,
+      "mean_ms": 662.677554876538,
+      "hz": 1.5090295312420952,
+      "path_length_m": 74.36485937598268,
+      "end_displacement_m": 6.079446701802372,
       "ate_rmse_m": 16.67964374917438,
       "n_frames": 500,
-      "device": "cpu"
+      "device": "cuda"
     }
   }
 }

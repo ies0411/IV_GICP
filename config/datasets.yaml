@@ -11,7 +11,7 @@
 # | GEODE urban tun  | 0.5   | 0.25   | 0.0   | 2.0 | 500 |  12 | 80m        | 0.5    |
 # | GEODE metro tun  | 0.5   | 0.2    | 0.5   | 1.5 | 200 |  20 | 60m        | 0.5    |
 # | MulRan (Ouster)  | 1.0   | 0.3    | 0.1   | 2.0 | 500 |  20 | None       | 0.1    |
-# | HeLiPR (Ouster)  | 1.0   | 0.3    | 0.0   | 2.0 |  20 |  20 | None       | 0.1    |
+# | HeLiPR (Ouster)  | 1.0   | 0.3    | 0.0   | 2.0 |  20 |  20 | None       | 0.5    |
 #
 # Key rules:
 #   alpha=0.0: uniform surfaces (urban tunnel concrete, HeLiPR Ouster reflectivity noise)
@@ -31,7 +31,7 @@ kitti:
     source_voxel_size: 0.3
     max_correspondence_distance: 2.0
     initial_threshold: 2.0
-    min_motion_th: 0.1
+    min_motion_th: 0.5        # 2026-04-20: 0.1→0.5 fixes full-seq turn divergence (seq02: 204m→10m)
     max_map_frames: 500
     max_iterations: 12
     min_range: 0.5
@@ -146,12 +146,13 @@ helipr:
     source_voxel_size: 0.3
     max_correspondence_distance: 2.0
     initial_threshold: 2.0
-    min_motion_th: 0.1
+    min_motion_th: 0.5         # 2026-04-21: 0.1→0.5 fixes DCC05 full-seq (378m→17.21m; beats KISS -42%)
     max_map_frames: 20         # small window: DCC05 open-area sections need tight age window
     max_iterations: 20         # 20 itr needed for convergence (high-density Ouster scans)
     min_range: 0.5
     max_range: 80.0
     map_radius: null           # age-based eviction
+    use_fim_weight: true       # C1: universally benefits Ouster OS1-64 (4/5 seqs improved, avg -28%)
     auto_alpha: false
     auto_alpha_from_intensity: false
     source_drop_small_voxels: false

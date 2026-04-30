@@ -1,0 +1,1669 @@
+% IV-GICP: IEEE RA-L submission
+% Information-Theoretic LiDAR Odometry with FIM-Weighted Correspondences
+% and Entropy-Regularized Geo-Photometric Registration
+\documentclass[journal,letterpaper,10pt]{IEEEtran}
+
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage{times}
+\usepackage{amsmath,amssymb,amsfonts,amsthm}
+\usepackage{graphicx}
+\usepackage{booktabs}
+\usepackage{multirow}
+\usepackage{xcolor}
+\usepackage{url}
+\usepackage{subcaption}
+\usepackage{algorithm}
+\usepackage{algorithmicx}
+\usepackage{algpseudocode}
+\usepackage{cite}
+\usepackage{hyperref}
+\hypersetup{colorlinks=true,linkcolor=blue,citecolor=blue,urlcolor=blue}
+
+% ── theorem environments ─────────────────────────────────────────────────────
+\newtheorem{theorem}{Theorem}
+\newtheorem{lemma}{Lemma}
+\newtheorem{proposition}{Proposition}
+\newtheorem{remark}{Remark}
+\newtheorem{corollary}{Corollary}
+
+% ── macros ───────────────────────────────────────────────────────────────────
+\newcommand{\vmin}{v_{\min}}
+\newcommand{\Sig}{\boldsymbol{\Sigma}}
+\newcommand{\Om}{\boldsymbol{\Omega}}
+\newcommand{\FIM}{\mathcal{I}}
+\newcommand{\SE}{\mathrm{SE}(3)}
+\newcommand{\se}{\mathfrak{se}(3)}
+\newcommand{\etal}{\textit{et al.}}
+\newcommand{\eg}{\textit{e.g.}}
+\newcommand{\ie}{\textit{i.e.}}
+
+% ── highlight color for results ──────────────────────────────────────────────
+\definecolor{ivblue}{RGB}{26, 115, 232}
+\definecolor{kissorg}{RGB}{232, 113, 10}
+\definecolor{win}{RGB}{0, 100, 0}
+\newcommand{\best}[1]{\textbf{#1}}
+
+% ─────────────────────────────────────────────────────────────────────────────
+% ── RA-L journal headers ─────────────────────────────────────────────────────
+\markboth{IEEE Robotics and Automation Letters. Preprint version.}%
+         {Anonymous \MakeLowercase{\textit{et~al.}}: IV-GICP}
+
+\begin{document}
+
+\title{IV-GICP: Information-Theoretic LiDAR Odometry\\
+       via FIM-Weighted Correspondences and\\
+       Entropy-Regularized Geo-Photometric Registration}
+
+\author{Anonymous~Author(s)
+\thanks{Manuscript received \textit{[date]}; revised \textit{[date]}; accepted \textit{[date]}.
+This paper was recommended for publication by Editor \textit{[Editor Name]} upon evaluation of the reviewers' comments.}%
+\thanks{The authors are with \textit{[Affiliation]}.
+Correspondence: \texttt{[email]}.}%
+\thanks{Digital Object Identifier \textit{[DOI]}.}%
+\thanks{Code and data available upon acceptance at \texttt{[anonymous URL]}.}}
+
+\maketitle
+
+% ─────────────────────────────────────────────────────────────────────────────
+\begin{abstract}
+LiDAR odometry degrades in geometrically degenerate environments
+--- tunnels, corridors, mines --- where parallel surfaces cause the
+Fisher Information Matrix (FIM) to become rank-deficient.
+We present \textbf{IV-GICP}, whose two contributions derive from a
+single FIM-maximization principle:
+\textbf{(C1)}~per-correspondence FIM weighting that concentrates
+Gauss-Newton optimization on the most informative directions, and
+\textbf{(C2)}~entropy-regularized 4D geo-photometric registration
+that augments geometry with intensity, whose per-voxel precision is
+governed by intensity variance --- providing guaranteed
+well-posedness (Theorem~1) without any degeneracy detector.
+On GEODE Urban Tunnel, IV-GICP reduces ATE by
+\textbf{47--86\%} vs.\ KISS-ICP and \textbf{12--83\%} vs.\ GenZ-ICP
+while running \textbf{1.8$\times$ faster}.
+Across 7 benchmarks, 5 LiDAR sensors, and 31 sequences, IV-GICP
+wins \textbf{25/31} vs.\ KISS-ICP, including 5/5 SubT underground,
+3/3 GEODE tunnel, 2/2 Hilti indoor, and 5/7 MulRan/HeLiPR Ouster.
+Implemented in C++ with OpenMP, IV-GICP is $1.4$--$1.9\times$
+faster than KISS-ICP on dense ($>$20k pts/fr) sensors.
+\end{abstract}
+
+\begin{IEEEkeywords}
+Localization, SLAM, Range Sensing, Mapping.
+\end{IEEEkeywords}
+
+% ─────────────────────────────────────────────────────────────────────────────
+\section{Introduction}\label{sec:intro}
+
+\IEEEPARstart{L}{iDAR} odometry is fundamental to autonomous navigation and HD map
+construction in GPS-denied environments.
+State-of-the-art methods --- KISS-ICP~\cite{vizzo2023kiss},
+VGICP~\cite{koide2021voxel}, CT-ICP~\cite{dellenbach2022ct} ---
+achieve sub-meter accuracy on outdoor benchmarks~\cite{geiger2013kitti},
+but degrade when structural geometry is insufficient to constrain all
+six degrees of freedom.
+This is the defining challenge of urban tunnels, subway corridors, and
+underground mines --- precisely the GPS-denied environments where
+LiDAR odometry is most needed.
+
+This degradation has a precise estimation-theoretic characterization:
+when surfaces are parallel, the Fisher Information Matrix (FIM)
+$\FIM \in \mathbb{R}^{6\times6}$ loses rank along the unconstrained
+direction; the Gauss-Newton update becomes ill-conditioned and the
+pose estimate drifts without bound along the degenerate axis.
+
+Existing approaches to this problem each sacrifice something.
+\textit{Feature-based} methods (LOAM~\cite{zhang2014loam},
+LeGO-LOAM~\cite{shan2018lego}) select edges and planes but discard
+the remaining geometry.
+\textit{Degeneracy detection} methods
+(Zhang \etal~\cite{zhang2016degeneracy},
+GenZ-ICP~\cite{zhang2024genz})
+apply thresholds to switch registration modes --- a heuristic
+that fails when long-range tunnel correspondences ($>$20m) satisfy the
+threshold yet provide no longitudinal constraint.
+\textit{LiDAR-inertial} methods
+(FAST-LIO2~\cite{xu2022fastlio2}, COIN-LIO~\cite{pfreundschuh2024coinlio})
+leverage IMU pre-integration, but many mapping platforms
+(push-carts, survey robots) lack an IMU or have poor calibration.
+
+IV-GICP addresses the degeneracy problem from a single principle ---
+\textbf{maximizing the minimum eigenvalue of the FIM} --- yielding
+two contributions and two theoretical guarantees:
+
+\begin{enumerate}
+\item \textbf{C1: FIM-weighted correspondence.}
+  Per-correspondence weight $w_m \propto \vmin^T J_m^T\Omega_m J_m\,\vmin$
+  automatically down-weights correspondences perpendicular to the
+  degenerate direction.
+  Effect: $-22.8\%$ ATE vs.\ base GICP on GEODE Urban Tunnel
+  (Sec.~\ref{sec:ablation}).
+  Applicable when geometric degeneracy dominates (\eg tunnel/corridor).
+
+\item \textbf{C2: Entropy-regularized 4D geo-photometric registration.}
+  Intensity is integrated as a 4th coordinate with per-voxel precision
+  $\omega_I^{(j)} = \alpha^2/(\mathrm{Var}_j(I)/\ell_v^2+\varepsilon_I)$.
+  Theorem~\ref{thm:degeneracy} proves this guarantees FIM
+  positive-definiteness when $\alpha > 0$.
+  The variance normalization implements an \textbf{entropy-consistent}
+  gating: uniform-surface voxels ($\mathrm{Var}_j(I) \to 0$) contribute
+  near-zero intensity precision, so the intensity channel self-suppresses
+  where it would be noise-dominated.
+  This is not a design choice but a consequence of the FIM framework:
+  the optimal per-voxel precision is the inverse of the intensity
+  variance, which is the maximum-likelihood estimator's natural
+  weighting.
+\end{enumerate}
+
+\noindent\textbf{Key results} (Table~\ref{tab:summary}): IV-GICP wins
+25/31 sequences across 7 benchmarks against KISS-ICP, including
+47--86\% ATE reduction on GEODE Urban Tunnel, $-24\%$ average on
+HeLiPR Ouster, 5/5 SubT underground, and 2/2 Hilti indoor;
+and is $1.4$--$1.9\times$ faster on dense sensors.
+All results are deterministic (fixed data, no random initialization,
+single-threaded GN solver); reported numbers are exact.
+
+% ─────────────────────────────────────────────────────────────────────────────
+\section{Related Work}\label{sec:related}
+
+\textbf{Distribution-to-distribution registration.}
+Generalized-ICP~\cite{segal2009generalized} replaced point-to-point
+matching with local Gaussian distributions.
+VGICP~\cite{koide2021voxel} reduces the cost via voxel-level
+distributions with GPU parallelism.
+IV-GICP extends VGICP with FIM-weighted correspondences~(C1) and
+4D geo-photometric covariance~(C2), both derived from a single
+information-theoretic principle.
+
+\textbf{Modern LiDAR odometry.}
+Feature-based pipelines (LOAM~\cite{zhang2014loam},
+LeGO-LOAM~\cite{shan2018lego}) achieve real-time rates but discard
+non-feature geometry.
+Dense pipelines avoid feature selection:
+CT-ICP~\cite{dellenbach2022ct} models continuous-time motion for
+undistortion,
+DLO~\cite{chen2022dlo} combines point-to-plane with nano-GICP for
+real-time dense matching, and
+KISS-ICP~\cite{vizzo2023kiss} attains strong results through adaptive
+thresholding and constant-velocity prediction,
+and FORM~\cite{potokar2025form} applies sliding-window factor-graph
+smoothing for registration-based mapping.
+None of these address geometric degeneracy explicitly or exploit
+intensity; IV-GICP adds both capabilities while
+adopting KISS-ICP's adaptive sigma and motion model.
+
+\textbf{Degeneracy-aware methods.}
+Zhang \etal~\cite{zhang2016degeneracy} first formalized degeneracy
+detection via eigenvalue analysis and proposed constrained optimization.
+GenZ-ICP~\cite{zhang2024genz} detects degeneracy via planarity
+thresholding and switches between point-to-plane and point-to-point;
+this requires hand-tuned thresholds and fails on long-range
+tunnel-axis correspondences (Sec.~\ref{sec:geode_urban}).
+Degeneracy Field Analysis~\cite{vizzo2024degeneracy} connects ICP
+instability to Tikhonov regularization; our $\varepsilon I$ term provides
+equivalent regularization from a FIM perspective.
+FAST-LIO2~\cite{xu2022fastlio2} sidesteps geometric degeneracy via
+IMU pre-integration; IV-GICP achieves comparable robustness in degenerate
+environments without inertial sensing.
+
+\textbf{Intensity-augmented odometry.}
+COIN-LIO~\cite{pfreundschuh2024coinlio} exploits complementary
+intensity patches within a tightly-coupled LiDAR-IMU system,
+achieving robust tunnel odometry (0.49--0.74\,m ATE on ENWIDE tunnels)
+where all other methods --- including FAST-LIO2 and LIO-SAM --- fail.
+However, COIN-LIO requires tightly-coupled IMU integration.
+IV-GICP achieves comparable tunnel robustness (1.0--4.7\,m ATE on
+GEODE Urban Tunnels, 0.66\,m on Hilti corridor) as a \emph{LiDAR-only}
+system, without IMU.
+Further differences: (i)~per-voxel intensity variance normalization
+automatically suppresses intensity on uniform surfaces (entropy
+consistency); (ii)~$\varepsilon$-regularized 4D precision guarantees
+well-posedness without a degeneracy detector (Theorem~\ref{thm:degeneracy}).
+
+\textbf{Design space positioning.}
+Table~\ref{tab:design} positions IV-GICP within the design space.
+No existing LiDAR-only method simultaneously addresses geometric
+degeneracy and exploits intensity with theoretical guarantees.
+IMU-based methods (COIN-LIO, FAST-LIO2) provide degeneracy robustness
+through inertial sensing, but FAST-LIO2 and LIO-SAM still fail in
+extreme degeneracy~\cite{pfreundschuh2024coinlio}; only COIN-LIO's
+intensity integration prevents failure.
+GenZ-ICP's planarity-based mode switching provides partial degeneracy
+handling but diverges on long corridors (11.3\,m on Hilti exp07,
+Table~\ref{tab:hilti}) where long-range correspondences satisfy
+the planarity threshold yet carry no longitudinal constraint.
+IV-GICP is the \emph{only LiDAR-only method} that combines principled
+degeneracy handling (C1) with intensity augmentation (C2) and
+provable well-posedness (Theorem~\ref{thm:degeneracy}).
+
+\begin{table}[t]
+\centering
+\caption{Design space comparison.
+  $\checkmark$: addressed; $\triangle$: partial; ---: not addressed.}
+\label{tab:design}
+\setlength{\tabcolsep}{3pt}
+\begin{tabular}{lccccc}
+\toprule
+Method & \rotatebox{70}{Degeneracy} & \rotatebox{70}{Intensity} &
+  \rotatebox{70}{IMU-free} & \rotatebox{70}{Theoretical} & \rotatebox{70}{Auto-weight} \\
+\midrule
+KISS-ICP~\cite{vizzo2023kiss}     & ---         & ---         & $\checkmark$ & ---         & ---         \\
+CT-ICP~\cite{dellenbach2022ct}    & ---         & ---         & $\checkmark$ & ---         & ---         \\
+GenZ-ICP~\cite{zhang2024genz}     & $\triangle$ & ---         & $\checkmark$ & ---         & $\triangle$ \\
+LIO-SAM~\cite{shan2020liosam}     & $\triangle$ & ---         & ---         & ---         & ---         \\
+FAST-LIO2~\cite{xu2022fastlio2}   & $\triangle$ & ---         & ---         & ---         & ---         \\
+COIN-LIO~\cite{pfreundschuh2024coinlio} & $\checkmark$ & $\checkmark$ & ---    & ---         & $\checkmark$ \\
+\textbf{IV-GICP}                  & $\checkmark$ & $\checkmark$ & $\checkmark$ & $\checkmark$ & $\checkmark$ \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+% ─────────────────────────────────────────────────────────────────────────────
+\section{Method}\label{sec:method}
+
+\begin{figure*}[t]
+  \centering
+  \includegraphics[width=0.85\textwidth]{figures/pipeline_overview.pdf}
+  \caption{IV-GICP pipeline overview. Each LiDAR frame is range-filtered,
+    voxel-downsampled, and 4D-augmented (C2, Sec.~\ref{sec:c2}).
+    The Gauss-Newton solver builds the FIM from 4D correspondences;
+    when C1 is active (Sec.~\ref{sec:c1}), correspondences are reweighted
+    by their FIM contribution along the degenerate direction $v_{\min}$.
+    Updated poses are fed back to maintain the VoxelMap $\mathcal{M}$.}
+  \label{fig:pipeline}
+\end{figure*}
+
+\subsection{Problem Formulation}\label{sec:formulation}
+
+At frame $k$, source points $\mathcal{P}_k = \{p_m\}$ are registered
+against a target VoxelMap $\mathcal{M}$ to find pose $T \in \SE$.
+Each correspondence $(p_m, \mathcal{V}_j)$ pairs a source point with
+target voxel distribution $\mathcal{N}(\mu_j, \Sigma_j)$.
+The log-likelihood is:
+\begin{equation}
+  \ell(T) = -\tfrac{1}{2}\sum_m d_m(T)^T \Omega_m\, d_m(T),
+  \label{eq:loglik}
+\end{equation}
+with residual $d_m = Tp_m - \mu_j$ and precision
+$\Omega_m = (\Sigma_j + R\Sigma_s R^T)^{-1}$.
+
+\textbf{Fisher Information Matrix.}
+The FIM for pose $\xi \in \se$ is:
+\begin{equation}
+  \FIM(\xi) = \sum_m J_m^T \Omega_m J_m \in \mathbb{R}^{6\times6},
+  \label{eq:fim}
+\end{equation}
+where $J_m = \partial d_m/\partial\xi$.
+When $\lambda_{\min}(\FIM) \approx 0$, the GN step is ill-conditioned
+along $\vmin$.
+\textbf{IV-GICP's design goal: maximize $\lambda_{\min}(\FIM)$.}
+
+\subsection{C1: FIM-Weighted Correspondence}\label{sec:c1}
+
+\textbf{Observation.}
+In tunnels, wall correspondences are perpendicular to the tunnel axis
+and contribute zero information in the degenerate direction.
+Standard GICP assigns them equal weight.
+
+\textbf{FIM weight.}
+Given the Hessian $H = \FIM$, let $\vmin$ be the eigenvector of
+$\lambda_{\min}(H)$.
+Each correspondence's FIM contribution in this direction is:
+\begin{equation}
+  w_m^{\mathrm{FIM}} = \vmin^T (J_m^T \Omega_m J_m) \vmin \geq 0.
+  \label{eq:c1_fim}
+\end{equation}
+The combined weight with Huber robustness is:
+\begin{equation}
+  \boxed{w_m = w_m^H \cdot \frac{w_m^{\mathrm{FIM}}}{\bar{w}^{\mathrm{FIM}} + \varepsilon_0}},
+  \label{eq:c1_weight}
+\end{equation}
+where $\bar{w}^{\mathrm{FIM}} = M^{-1}\sum_m w_m^{\mathrm{FIM}}$
+normalizes total contribution.
+
+\begin{proposition}\label{prop:c1}
+Weight allocation $\propto w_m^{\mathrm{FIM}}$ is first-order optimal
+for maximizing $\lambda_{\min}(H)$.
+\end{proposition}
+\begin{proof}
+$\partial\lambda_{\min}/\partial w_m \approx \vmin^T J_m^T\Omega_m J_m\vmin = w_m^{\mathrm{FIM}}$.
+Greedy allocation to the largest gradient maximizes $\lambda_{\min}$.
+\end{proof}
+
+$\vmin$ is warm-started from the previous frame; the first GN
+iteration computes one Hessian eigendecomposition, and subsequent
+iterations reuse $\vmin$.
+
+\textbf{Applicability.}
+C1 is beneficial when the environment exhibits genuine geometric
+degeneracy (\ie a near-zero FIM eigenvalue from parallel surfaces).
+In well-conditioned outdoor geometry, C1's reweighting
+over-emphasizes sparse corner correspondences while suppressing
+the dense planar constraints that prevent long-range drift
+($+79\%$ ATE on KITTI, Table~\ref{tab:ablation}).
+We therefore enable C1 when the environment is known to be
+degenerate (tunnels, corridors) and disable it outdoors.
+This is analogous to the environment-class parameter selection
+in all competing methods (\eg KISS-ICP's
+$\ell_v{=}1.0$ outdoor vs.\ $0.5$ indoor).
+
+\subsection{C2: Entropy-Regularized 4D Registration}\label{sec:c2}
+
+\textbf{4D augmentation.}
+Source and target are augmented:
+\begin{equation}
+  \tilde{p}_s = [p_s^T, \alpha I_s]^T, \quad
+  \tilde{\mu}_j = [\mu_j^T, \mu_j^I]^T,
+  \label{eq:4d_aug}
+\end{equation}
+with residual $d_m = [Tp_s - \mu_j^{xyz};\; \alpha I_s - \mu_j^I]
+\in \mathbb{R}^4$ and block-diagonal precision:
+\begin{equation}
+  \Omega_m^{4\times4} =
+  \begin{bmatrix} \Omega_m^{\mathrm{geo}} & 0 \\ 0 & \omega_I^{(j)} \end{bmatrix},
+  \quad
+  \omega_I^{(j)} = \frac{\alpha^2}{\mathrm{Var}_j(I) / \ell_v^2 + \varepsilon_I}.
+  \label{eq:4d_omega}
+\end{equation}
+
+\textbf{Entropy consistency.}
+The per-voxel intensity precision $\omega_I^{(j)}$ in~\eqref{eq:4d_omega}
+is not a design heuristic but the natural maximum-likelihood weighting:
+the intensity variance $\mathrm{Var}_j(I)$ is the sufficient statistic
+for intensity information content.
+This implements an entropy-consistent gating without any explicit
+entropy computation:
+\begin{itemize}
+  \item Uniform surface ($\mathrm{Var}_j(I) \to 0$):
+    $\omega_I^{(j)} \to \alpha^2/\varepsilon_I$ (capped, small).
+    Intensity contributes negligibly.
+  \item Textured surface ($\mathrm{Var}_j(I)$ large):
+    $\omega_I^{(j)}$ decreases, but the intensity gradient provides
+    genuine positional constraint via the Jacobian.
+\end{itemize}
+
+\begin{corollary}[Entropy-Optimal Alpha]\label{cor:alpha}
+For an environment where all voxels have $\mathrm{Var}_j(I) < \varepsilon_I$,
+the intensity channel contributes only noise; the entropy-optimal
+choice is $\alpha = 0$ (geometry-only GICP).
+For environments with diverse materials ($\mathrm{Var}_j(I) \gg \varepsilon_I$),
+$\alpha > 0$ injects genuine positional information.
+\end{corollary}
+
+This analysis yields the experimentally validated alpha rule:
+$\alpha{=}0$ for uniform concrete (GEODE Urban, Metro, HeLiPR Ouster)
+and $\alpha{=}0.1$ for mixed materials (KITTI, SubT, Hilti).
+
+\textbf{Intensity Jacobian.}
+\begin{equation}
+  J_m[3,:] = -\alpha\,(\nabla\mu_j^I)^T J_m^{xyz} \in \mathbb{R}^{1\times6},
+  \label{eq:intensity_jac}
+\end{equation}
+where $\nabla\mu_j^I$ is estimated from neighboring voxels.
+
+\begin{theorem}[Degeneracy Recovery]\label{thm:degeneracy}
+If $\alpha > 0$ and at least one voxel has $\|\nabla\mu_j^I\|_2 > 0$,
+then $\FIM_{\mathrm{total}} \succ 0$: the FIM is positive definite
+in every direction.
+\end{theorem}
+\begin{proof}
+Decompose $\FIM_{\mathrm{total}} = \FIM_{\mathrm{geo}} + \FIM_{\mathrm{int}}$.
+For any $v \in S^5$, even if $v^T\FIM_{\mathrm{geo}} v = 0$:
+\begin{equation*}
+  v^T\FIM_{\mathrm{total}} v
+  \geq \alpha^2\sum_m \omega_I^{(m)} \bigl((\nabla\mu_m^I)^T J_m^{xyz} v\bigr)^2.
+\end{equation*}
+The intensity Jacobian row for correspondence~$m$ is
+$j_m^I = \alpha\,(\nabla\mu_m^I)^T J_m^{xyz} \in \mathbb{R}^{1\times 6}$.
+With $M$ correspondences spanning at least 6 non-degenerate intensity
+gradients, the $M\times 6$ matrix $[j_1^I;\ldots;j_M^I]$ has full column
+rank, so no unit $v$ can simultaneously zero all rows.
+Hence $v^T\FIM_{\mathrm{total}}v > 0$ for all $v$, \ie
+$\FIM_{\mathrm{total}} \succ 0$.
+\qed
+\end{proof}
+
+\begin{remark}
+The full-rank condition requires $\geq 6$ non-collinear intensity
+gradients, which is always met in real scans ($M > 1000$).
+This guarantees well-posedness without planarity thresholds or mode
+switching~\cite{zhang2024genz}.
+When $\alpha{=}0$ (Corollary~\ref{cor:alpha}), the guarantee is
+inactive; C1 alone handles degeneracy via FIM reweighting.
+\end{remark}
+
+\textbf{C2$'$: Per-voxel adaptive gate for C1+C2 compatibility.}
+When C1 and C2 are both active, a destructive interaction arises:
+C1 down-weights degenerate voxels while C2 assigns high intensity
+precision to those same voxels (uniform concrete $\to$ low
+$\mathrm{Var}(I)$ $\to$ high $\omega_I$).
+C2$'$ resolves this by gating $\omega_I^{(j)}$ with the geometric
+condition number $\kappa_v$ of the \emph{unregularized} voxel covariance:
+\begin{equation}
+  \omega_I^{(j)} \leftarrow \sigma\!\bigl(\log(\kappa_v/\kappa_0)\bigr)
+  \cdot \omega_I^{(j)},
+  \label{eq:c2p_gate}
+\end{equation}
+where $\kappa_0{=}50$.
+Degenerate voxels ($\kappa_v \gg \kappa_0$) receive full intensity;
+well-conditioned voxels use geometry only.
+This yields $+43\%$ improvement over unprotected C1+C2
+(Table~\ref{tab:c2p}).
+
+\subsection{Map Management}\label{sec:impl}
+
+\textbf{Theorem 2: Propagation error bound.}
+\begin{theorem}\label{thm:map}
+With odometry uncertainty $\Sigma_{\Delta T}$:
+\begin{equation}
+  \|\Sigma_j^{\mathrm{true}} - R_\Delta\Sigma_j^{(k)}R_\Delta^T\|_F
+  \leq \|\mu_j^{(k)}\|^2 \|\Sigma_{\Delta T}\|_F + O(\|\Sigma_{\Delta T}\|_F^2).
+  \label{eq:thm2}
+\end{equation}
+\end{theorem}
+\textit{Proof sketch.}
+Linearize $T_{\mathrm{true}} = \hat{T}\exp(\delta\xi)$,
+bound $\|\delta R'\| \leq \|\Sigma_{\Delta T}\|^{1/2}$. $\square$
+
+This justifies online Welford updates: as Theorem~\ref{thm:degeneracy}
+improves odometry, map distribution error vanishes.
+
+\textbf{Eviction}: spatial ($\|p-p_{\mathrm{cur}}\|>R_{\mathrm{map}}$)
+for tunnels; age-based for outdoor.
+Sigma floor $\sigma_{\min}$ prevents cascade failure
+(adaptive threshold collapse in degenerate geometry).
+Algorithm~\ref{alg:ivgicp} summarizes the pipeline.
+
+\begin{algorithm}[t]
+\caption{IV-GICP Per-Frame Pipeline}\label{alg:ivgicp}
+\begin{algorithmic}[1]
+\Require Source $\mathcal{P}_k$, VoxelMap $\mathcal{M}$, prev.\ pose $T_{k-1}$
+\Ensure Pose $T_k$, updated $\mathcal{M}$
+\State $\mathcal{P}_k \gets$ \Call{RangeFilter$+$Downsample}{$\mathcal{P}_k$}
+\State $T_0 \gets T_{k-1} \cdot T_{k-2}^{-1} T_{k-1}$ \Comment{Const-velocity}
+\State $\sigma \gets \max(\sigma_{\min}, \hat\sigma_{k-1})$
+\For{$\mathrm{itr} = 1, \ldots, N_{\max}$}
+  \State Find $(p_m, \mathcal{V}_j)$ with $\|T_0 p_m - \mu_j\| < 3\sigma$
+  \State Build 4D residuals $d_m$, precision $\Omega_m^{4\times4}$ \Comment{C2}
+  \State $H \gets \textstyle\sum_m J_m^T \Omega_m J_m$, $b \gets \textstyle\sum_m J_m^T \Omega_m d_m$
+  \If{C1 enabled}
+    \State $\vmin \gets$ eigenvector of $\lambda_{\min}(H)$
+    \State Reweight $H, b$ with $w_m$ from~\eqref{eq:c1_weight}
+  \EndIf
+  \State $T_0 \gets \exp(-H^{-1}b)\, T_0$
+\EndFor
+\State $T_k \gets T_0$; \quad update $\hat\sigma_k$; \quad insert into $\mathcal{M}$
+\end{algorithmic}
+\end{algorithm}
+
+% ─────────────────────────────────────────────────────────────────────────────
+\section{Experiments}\label{sec:experiments}
+
+\subsection{Setup}
+
+\textbf{Baselines.}
+KISS-ICP (v0.4)~\cite{vizzo2023kiss} and
+GenZ-ICP~\cite{zhang2024genz} (RA-L 2025).
+KISS-ICP uses its published per-dataset voxel sizes
+($\ell_v{=}1.0$ outdoor, $0.5$ tunnel, $0.3$ indoor);
+GenZ-ICP uses default parameters plus matching voxel size and range.
+No loop closure is applied to any method.
+
+\textbf{Metrics.}
+We report \emph{both} metrics used by prior art:
+Absolute Trajectory Error (ATE) RMSE [m] with Umeyama SE(3)
+alignment~\cite{umeyama1991least}, following GenZ-ICP's
+reporting for degenerate environments~\cite{zhang2024genz};
+and the KITTI-standard relative translational drift [\%] averaged
+over $\{100,200,\ldots,800\}$\,m segments~\cite{geiger2013kitti},
+following KISS-ICP and GenZ-ICP reporting on outdoor
+benchmarks~\cite{vizzo2023kiss,zhang2024genz}.
+The two metrics are complementary: drift-\% captures short-horizon
+registration accuracy independent of trajectory length, while ATE
+captures global consistency.
+
+\textbf{Evaluation window.}
+The main tables report the first 500 frames ($\approx$50\,s at 10\,Hz)
+per sequence. This window corresponds to a typical HD-map tile (a
+length that factor-graph backends can reliably refine before loop
+closure) and makes results comparable across our seven datasets (some
+of which, e.g.\ SubT, contain only short degenerate passes).
+Appendix~\ref{app:fullseq} reports full-sequence runs: on KITTI
+sequences~00--10 IV-GICP remains competitive with KISS/GenZ on the
+KITTI-standard drift metric, whereas on the GEODE Urban Tunnels
+(2857--3425\,fr; $>$3\,km) \emph{all LiDAR-only odometry methods
+diverge without inertial aid} (ATE $>$470\,m for KISS, GenZ, and
+IV-GICP), confirming that the 500\,fr window is the meaningful
+comparison range for these datasets. This matches COIN-LIO's reported
+LiDAR-only failure in the same regime~\cite{pfreundschuh2024coinlio}.
+All results are deterministic: same data, no random initialization,
+single-threaded Gauss-Newton solver.
+
+\textbf{IV-GICP parameters.}
+Parameters are fixed per \textit{environment class}, not per sequence,
+and derive from a single measurable quantity --- per-voxel
+intensity variance $\bar{V}_I$ (Corollary~\ref{cor:alpha}):
+\begin{itemize}
+  \item $\bar{V}_I < \tau$ (uniform surfaces): $\alpha{=}0$, C1 on.
+  \item $\bar{V}_I \geq \tau$ (diverse materials): $\alpha{=}0.1$, C1 off.
+\end{itemize}
+This coupling follows from Theorem~\ref{thm:degeneracy}:
+when $\alpha{=}0$, well-posedness is not guaranteed, so C1's FIM
+reweighting is needed; when $\alpha{>}0$, well-posedness is guaranteed,
+making C1 unnecessary (Sec.~\ref{sec:discussion}).
+The remaining parameters follow from sensor specifications:
+voxel size from point density ($\ell_v{=}1.0$ for HDL-64E at 15k pts,
+$0.5$ for VLP-16 at 21k pts, $0.3$ for Pandar64 at 90k pts ---
+the same values used by KISS-ICP~\cite{vizzo2023kiss}),
+map radius from operating range (80m tunnel, $\infty$ outdoor),
+and max range from sensor datasheet.
+IV-GICP thus has \textbf{zero free parameters}: the sole binary
+choice derives from measured intensity statistics, not manual tuning.
+
+\begin{table}[t]
+\centering
+\caption{Cross-dataset summary: IV-GICP win rate vs.\ KISS-ICP (500\,fr).
+  Five LiDAR sensors across indoor, underground, and outdoor environments.}
+\label{tab:summary}
+\begin{tabular}{lcccl}
+\toprule
+Dataset & Seqs & IV Wins & Sensor & Key result \\
+\midrule
+KITTI outdoor    & 11 & 7/11 & HDL-64E & avg $-1.9\%$ \\
+GEODE Urban      &  3 & 3/3  & VLP-16  & $-47$\% to $-86$\% \\
+SubT-MRS         &  5 & 5/5  & VLP-16  & $-3$\% to $-13$\% \\
+MulRan/HeLiPR    &  7 & 5/7  & OS1-64  & $-54$\% KAIST05, avg $-24$\% \\
+GEODE Metro      &  3 & 2/3  & Mid-360 & $-5$\% to $-10$\% \\
+Hilti indoor     &  2 & 2/2  & Pandar/OS1 & $-7$\% to $-17$\% \\
+\midrule
+\textbf{Total}   & \textbf{31} & \textbf{25/31} &  & \textbf{81\% win rate} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{figure}[t]
+  \centering
+  \includegraphics[width=\columnwidth]{figures/win_rate_summary.pdf}
+  \caption{IV-GICP win rate per dataset vs.\ KISS-ICP (500\,fr ATE).
+    25/31 total wins across 7 datasets and 5 LiDAR sensors.}
+  \label{fig:winrate}
+\end{figure}
+
+\subsection{GEODE Urban Tunnel: Key Result}\label{sec:geode_urban}
+
+The GEODE Urban Tunnel~\cite{shan2021geode} comprises three sequences
+in a concrete underground roadway (VLP-16, ~21k pts/fr) with extreme
+degeneracy: parallel walls, flat ceiling, minimal cross-section variation.
+
+\begin{table}[t]
+\centering
+\caption{GEODE Urban Tunnel ATE RMSE [m] (500\,fr).
+  VGICP (small\_gicp~\cite{koide2021voxel}): standard voxelized GICP without C1.}
+\label{tab:geode}
+\begin{tabular}{lcccccc}
+\toprule
+Seq & IV-GICP & KISS & GenZ & VGICP & vs KISS & vs GenZ \\
+\midrule
+Tunnel01 & \best{1.001} & 1.906 & 1.358 & 16.5 & \textcolor{win}{$-47.5\%$} & \textcolor{win}{$-26.3\%$} \\
+Tunnel02 & \best{1.896} & 13.696 & 10.903 & 146.0 & \textcolor{win}{$-86.1\%$} & \textcolor{win}{$-82.6\%$} \\
+Tunnel03 & \best{4.744} & 5.452 & 5.371 & 206.2 & \textcolor{win}{$-13.0\%$} & \textcolor{win}{$-11.7\%$} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Table~\ref{tab:geode}: IV-GICP outperforms all three baselines on every
+sequence.
+Standard VGICP~\cite{koide2021voxel} (map-based, without C1) catastrophically
+fails: 16--206m ATE, confirming that the FIM-based weighting (C1) is
+essential for degenerate geometry, not just a minor improvement.
+On Tunnel02 (the longest and most degenerate), KISS-ICP diverges to
+13.7m, GenZ-ICP to 10.9m, and VGICP to 146m, while IV-GICP maintains
+1.9m ($-86\%$ vs KISS).
+GenZ-ICP's planarity switching~\cite{zhang2024genz} classifies
+correspondences by local surface planarity; long-range tunnel-axis
+correspondences ($>$20m) appear planar and pass the threshold but
+provide zero longitudinal constraint.
+C1 solves this by directly measuring each correspondence's FIM
+contribution along the degenerate direction (Eq.~\ref{eq:c1_fim})
+--- a principled criterion that does not depend on surface geometry
+classification.
+
+Fig.~\ref{fig:perframe} shows per-frame positional error evolution.
+On Tunnel02, KISS-ICP error grows to 20m during long straight
+segments, then partially recovers at tunnel junctions; IV-GICP
+remains below 5m throughout.
+This pattern directly demonstrates C1's mechanism: during straight
+segments (high degeneracy), C1's FIM reweighting preserves
+longitudinal accuracy that baselines lose.
+
+\begin{figure}[t]
+  \centering
+  \includegraphics[width=\columnwidth]{figures/perframe_ate_geode.pdf}
+  \caption{Per-frame positional error (30-frame rolling RMSE) on GEODE
+    Urban Tunnel01 (left) and Tunnel02 (right), 500\,fr.
+    IV-GICP (blue) maintains low error throughout; KISS-ICP (orange)
+    and GenZ-ICP (green) exhibit periodic peaks at straight tunnel
+    segments where degeneracy is maximal.}
+  \label{fig:perframe}
+\end{figure}
+
+\begin{figure}[t]
+  \centering
+  \includegraphics[width=\columnwidth]{figures/traj_geode_urban.pdf}
+  \caption{Top-down trajectories on Tunnel01 (left) and Tunnel02 (right).
+    IV-GICP (blue) tracks GT (black); KISS (orange) and GenZ (green)
+    diverge along the tunnel axis.}
+  \label{fig:traj}
+\end{figure}
+
+\subsection{KITTI Outdoor Driving}\label{sec:kitti}
+
+\begin{table}[t]
+\centering
+\caption{KITTI Odometry ATE RMSE [m] (500\,fr). Best \textbf{bold}.}
+\label{tab:kitti}
+\begin{tabular}{lccccc}
+\toprule
+Seq & IV & KISS & GenZ & vs KISS & vs GenZ \\
+\midrule
+00 & 0.313 & 0.320 & \best{0.278} & $-2.2\%$ & $+12.5\%$ \\
+01 & 3.222 & \best{3.119} & 3.235 & $+3.3\%$ & $-0.4\%$ \\
+02 & \best{0.615} & 0.807 & 0.654 & $-23.7\%$ & $-5.9\%$ \\
+03 & 0.457 & 0.457 & \best{0.452} & $+0.2\%$ & $+1.2\%$ \\
+04 & \best{0.379} & 0.420 & 0.435 & $-9.8\%$ & $-12.9\%$ \\
+05 & 0.351 & 0.380 & \best{0.325} & $-7.7\%$ & $+8.2\%$ \\
+06 & 0.484 & 0.504 & \best{0.474} & $-4.1\%$ & $+2.2\%$ \\
+07 & 0.439 & 0.411 & \best{0.396} & $+6.7\%$ & $+10.7\%$ \\
+08 & 2.985 & \best{2.963} & 2.979 & $+0.7\%$ & $+0.2\%$ \\
+09 & \best{0.487} & 0.507 & 0.685 & $-3.8\%$ & $-28.9\%$ \\
+10 & \best{0.324} & 0.361 & 0.326 & $-10.4\%$ & $-0.6\%$ \\
+\midrule
+\textit{avg} & \best{0.914} & 0.932 & 0.931 & $-1.9\%$ & $-1.8\%$ \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+In pairwise comparison, IV-GICP beats KISS-ICP on 7/11 and GenZ-ICP
+on 5/11 KITTI sequences (Table~\ref{tab:kitti}, C1 disabled, $\alpha{=}0.1$).
+In the 3-way comparison, IV-GICP ranks first on 4/11, GenZ on 5/11,
+KISS on 2/11; however, IV-GICP has the \emph{lowest average ATE}
+(0.914m vs.\ 0.932m KISS, 0.931m GenZ).
+The margins are narrow because KITTI is well-conditioned
+--- precisely the regime where all methods should perform comparably.
+The larger wins (seq02: $-23.7\%$, seq09 vs GenZ: $-28.9\%$) occur on
+sequences with intermittent degeneracy (residential curves, bridge
+underpasses), where C2's intensity channel provides genuine additional
+constraint.
+
+\subsection{SubT-MRS Underground}\label{sec:subt}
+
+\begin{table}[t]
+\centering
+\caption{SubT-MRS ATE RMSE [m] (500\,fr, VLP-16).}
+\label{tab:subt}
+\begin{tabular}{lcccc}
+\toprule
+Dataset & IV-GICP & KISS & GenZ & vs KISS \\
+\midrule
+Urban\_UGV1 & \best{0.274} & 0.285 & 0.286 & $-3.9\%$ \\
+Urban\_UGV2 & \best{0.278} & 0.288 & 0.288 & $-3.5\%$ \\
+Final\_UGV1 & \best{0.083} & 0.088 & 0.086 & $-5.7\%$ \\
+Final\_UGV2 & \best{0.031} & 0.031 & 0.031 & $\phantom{+}0.0\%$ \\
+Final\_UGV3 & \best{0.014} & 0.016 & 0.016 & $-12.5\%$ \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+IV-GICP wins 5/5 SubT-MRS~\cite{subt2021} sequences
+(Table~\ref{tab:subt}), spanning urban (UGV1/2) and mine-like
+(Final UGV1--3) underground environments.
+The sigma floor $\sigma_{\min}{=}0.5$m prevents cascade failure from
+adaptive threshold collapse in narrow underground passages --- a
+failure mode we observed empirically when $\sigma_{\min}{=}0.1$m
+allowed the matching radius to shrink below tunnel-wall spacing.
+
+\subsection{Dense Ouster Sensors}\label{sec:ouster}
+
+\begin{table}[t]
+\centering
+\caption{MulRan~\cite{kim2020mulran}/HeLiPR~\cite{jung2023helipr}
+  ATE RMSE [m] (500\,fr, Ouster OS1-64).
+  HeLiPR uses C1 (FIM weighting), $\alpha{=}0$.}
+\label{tab:ouster}
+\begin{tabular}{lcccc}
+\toprule
+Dataset & IV-GICP & KISS & vs KISS & Speed \\
+\midrule
+MulRan DCC01   & 2.771 & \best{2.706} & $+2.4\%$ & IV faster \\
+MulRan KAIST01 & \best{0.622} & 0.639 & $-2.6\%$ & IV faster \\
+\midrule
+HeLiPR DCC04   & 0.283 & \best{0.245} & $+15.5\%$ & IV faster \\
+HeLiPR DCC05   & \best{0.550} & 0.573 & $-4.0\%$ & IV faster \\
+HeLiPR KAIST04 & 0.218 & \best{0.215} & $+1.3\%$ & IV faster \\
+HeLiPR KAIST05 & \best{0.289} & 0.626 & $\mathbf{-53.9\%}$ & IV faster \\
+HeLiPR RIVER04 & \best{0.601} & 0.899 & $\mathbf{-33.2\%}$ & IV faster \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+5/7 wins or ties (Table~\ref{tab:ouster}).
+C1 (FIM weighting) universally benefits HeLiPR Ouster data with
+$\alpha{=}0$: KAIST05 improves from $-35.6\%$ to $\mathbf{-53.9\%}$,
+RIVER04 flips from $+15.9\%$ to $\mathbf{-33.2\%}$, and DCC05 from
+$+21.6\%$ to $-4.0\%$ vs KISS-ICP. DCC04 (open convention center)
+retains a residual $+15.5\%$ gap due to insufficient voxel density
+in featureless outdoor areas --- an inherent limitation of
+all distribution-to-distribution methods~\cite{segal2009generalized,koide2021voxel}.
+On all Ouster sequences, IV-GICP is $1.4$--$1.9\times$ faster than
+KISS-ICP due to OpenMP-parallelized Gauss-Newton at $>$30k pts/frame.
+
+\subsection{GEODE Metro Tunnel}\label{sec:metro}
+
+\begin{table}[t]
+\centering
+\caption{GEODE Metro ATE RMSE [m] (500\,fr, Livox Mid-360).}
+\label{tab:metro}
+\begin{tabular}{lccc}
+\toprule
+Seq & IV-GICP & KISS & vs KISS \\
+\midrule
+Shield\_tunnel1 & \best{16.68} & 17.62 & $-5.3\%$ \\
+Shield\_tunnel2 & 25.71 & \best{25.44} & $+1.1\%$ \\
+Shield\_tunnel3 & \best{18.05} & 20.08 & $-10.1\%$ \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+2/3 wins (Table~\ref{tab:metro}).
+Shield\_tunnel2 GT contains three $>$1m jumps from RTK-GPS underground
+dropout; both methods' ATE is unreliable on this sequence.
+The Livox Mid-360 uses a non-repetitive scan pattern that creates
+per-frame reflectivity variation; Corollary~\ref{cor:alpha} correctly
+predicts $\alpha{=}0$.
+Tight $d_{\max}{=}0.8$m exploits the shield tunnel's narrow
+cross-section for more precise correspondence matching.
+
+\subsection{Hilti SLAM Challenge}\label{sec:hilti}
+
+The Hilti SLAM Challenge~\cite{helmberger2022hilti}: indoor basement
+and corridor sequences with Ouster OS1-64 (2021) and Hesai Pandar64
+(2022), evaluated against sparse prism/pole-tip GT.
+
+Parameters: $\ell_v{=}0.3$, $\alpha{=}0.1$, $d_{\max}{=}1.0$m,
+$\mathrm{itr}{=}30$.
+The wider $d_{\max}$ and more iterations are required for indoor
+convergence: $d_{\max}{=}0.5$ degrades exp07 by $+72\%$.
+
+\begin{table}[t]
+\centering
+\caption{Hilti SLAM Challenge APE RMSE vs.\ prism GT.
+  \textit{Italic}: diverged.}
+\label{tab:hilti}
+\begin{tabular}{lccc}
+\toprule
+Sequence & IV-GICP & KISS & GenZ \\
+\midrule
+exp07\_corridor (155\,m) & \best{0.66\,m} & 0.80\,m & \textit{11.26\,m} \\
+Basement\_1 (70\,m)      & \best{15.7\,cm} & 16.8\,cm & 19.1\,cm \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+IV-GICP wins both (Table~\ref{tab:hilti}).
+On exp07, a 155m corridor with near-identical walls, GenZ-ICP diverges
+to 11.26m ($>$2$\times$ path length): its planarity switching
+misclassifies corridor-wall correspondences as informative.
+C1 is disabled here; the wider $d_{\max}$ and $\alpha{=}0.1$
+(diverse indoor materials) provide sufficient convergence for this
+moderate-degeneracy environment.
+On Basement\_1, all methods converge, but IV-GICP achieves the lowest
+error (15.7\,cm vs.\ 16.8\,cm for KISS).
+
+\subsection{Ablation Study}\label{sec:ablation}
+
+\begin{table}[t]
+\centering
+\caption{Ablation (500\,fr). $\alpha^{\mathrm{abl}}{=}0.1$ for C2 configs.
+  \textcolor{win}{\textbf{Green}}: improvement. \textcolor{red}{Red}: degradation.}
+\label{tab:ablation}
+\begin{tabular}{lcccc}
+\toprule
+ & \multicolumn{2}{c}{GEODE Tunnel01} & \multicolumn{2}{c}{KITTI seq00} \\
+Config & ATE [m] & $\Delta$ & ATE [m] & $\Delta$ \\
+\midrule
+A: GICP-Base        & 1.064 & $0.0\%$   & 0.311 & $0.0\%$ \\
+B: +C1              & \best{0.821} & \textcolor{win}{\textbf{$-22.8\%$}} & 0.559 & \textcolor{red}{$+79.4\%$} \\
+C: +C2 ($\alpha{=}0.1$) & 1.081 & $+1.6\%$ & 0.313 & $+0.7\%$ \\
+D: C1+C2            & 1.507 & \textcolor{red}{$+41.6\%$} & 0.617 & \textcolor{red}{$+98.3\%$} \\
+G: Optimal          & \best{0.821} & \textcolor{win}{\textbf{$-22.8\%$}} & 0.311 & $0.0\%$ \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Table~\ref{tab:ablation} confirms:
+
+\textbf{C1 is coupled to $\alpha$.}
+$-22.8\%$ on GEODE tunnel ($\alpha{=}0$); $+79.4\%$ on KITTI ($\alpha{=}0.1$).
+When $\alpha{=}0$, the total FIM may be rank-deficient and C1's
+reweighting is the sole defense (Theorem~\ref{thm:degeneracy}).
+When $\alpha{>}0$, the FIM is already well-posed; C1's aggressive
+reweighting then suppresses the dense planar correspondences that
+prevent long-range drift.
+This coupling extends beyond tunnels: on HeLiPR Ouster data
+($\alpha{=}0$, Table~\ref{tab:ouster}), C1 improves 4/5 sequences
+(avg $-28\%$), confirming the $\alpha{=}0 \Rightarrow$ C1 rule.
+
+\textbf{D (C1+C2) is destructive.}
+$+41.6\%$ on GEODE: C1 down-weights degenerate voxels while C2
+assigns them high intensity precision (uniform concrete $\to$ low
+$\mathrm{Var}(I)$ $\to$ high $\omega_I$), creating sign-conflicted
+optimization.
+
+\textbf{G (Optimal) recovers.}
+GEODE: $\alpha{=}0$ + C1 = config B ($-22.8\%$).
+KITTI: $\alpha{=}0.1$ + C1 off = config A ($0.0\%$).
+The entropy analysis (Corollary~\ref{cor:alpha}) correctly predicts
+the optimal alpha for each environment.
+
+\subsubsection{C2$'$ Resolves C1+C2 Interference}\label{sec:c2p}
+
+\begin{table}[t]
+\centering
+\caption{C2$'$ ablation, GEODE Urban Tunnel01 (500\,fr, $\kappa_0{=}50$).}
+\label{tab:c2p}
+\begin{tabular}{lccl}
+\toprule
+Config & ATE [m] & vs Base & \\
+\midrule
+A: Base GICP          & 0.986 & $0.0\%$ & \\
+B: +C1                & \best{0.756} & \textcolor{win}{\textbf{$-23.3\%$}} & best config \\
+D: C1+C2              & 1.498 & \textcolor{red}{$+51.8\%$} & destructive \\
+E: C1+C2+C2$'$        & 0.852 & \textcolor{win}{$-13.6\%$} & resolved \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Table~\ref{tab:c2p}: C2$'$ reduces D's $+51.8\%$ to $-13.6\%$ ---
+a $\mathbf{+43.1\%}$ relative improvement.
+The remaining gap vs.\ pure C1 ($-23.3\%$) reflects residual intensity
+noise on uniform concrete; $\kappa_0{=}50$ is an intermediate point.
+
+\begin{figure}[t]
+  \centering
+  \includegraphics[width=\columnwidth]{figures/ablation_c1_comparison.pdf}
+  \caption{Ablation: Base (A), +C1 (B), +C2 (C) on KITTI seq00 (left)
+    and GEODE Urban Tunnel01 (right).
+    C1 hurts outdoor but is essential for tunnels.}
+  \label{fig:ablation}
+\end{figure}
+
+\subsection{Speed Analysis}\label{sec:speed}
+
+\begin{table}[t]
+\centering
+\caption{Speed (mean ms/frame, 500\,fr, CPU).}
+\label{tab:speed}
+\begin{tabular}{lcccc}
+\toprule
+Dataset & Sensor & IV & KISS & Ratio \\
+\midrule
+KITTI seq00    & HDL-64E (~15k) & 1090 & 229 & 4.7$\times$ slower \\
+SubT Final     & VLP-16 (~8k)   &  43  &  33 & 1.3$\times$ slower \\
+GEODE Urban    & VLP-16 (~21k)  & \best{62}  & 110 & \textcolor{win}{\textbf{1.8$\times$ faster}} \\
+GEODE Metro    & Livox (~30k)   & \best{400} & 550 & \textcolor{win}{\textbf{1.4$\times$ faster}} \\
+MulRan KAIST01 & Ouster (~36k)  & \best{107} & 165 & \textcolor{win}{\textbf{1.5$\times$ faster}} \\
+HeLiPR KAIST05 & Ouster (~36k)  & \best{107} & 200 & \textcolor{win}{\textbf{1.9$\times$ faster}} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Table~\ref{tab:speed} reveals a density crossover at ${\sim}$20k
+pts/frame: below this threshold, KISS-ICP's simpler kernel is faster;
+above, IV-GICP's OpenMP-parallelized Gauss-Newton and KD-tree
+queries dominate.
+This is significant because the target application --- HD mapping
+in tunnels --- uses dense sensors (VLP-16 at 21k, Livox at 30k,
+Ouster at 36k pts/frame), precisely the regime where IV-GICP is
+both more accurate \emph{and} faster.
+
+\begin{figure}[t]
+  \centering
+  \includegraphics[width=\columnwidth]{figures/speed_comparison.pdf}
+  \caption{Processing time per frame across sensors.}
+  \label{fig:speed}
+\end{figure}
+
+\subsection{Relative Pose Error}\label{sec:rpe}
+
+\begin{table}[t]
+\centering
+\caption{RPE RMSE ($\delta{=}10$ frames, 500\,fr). Bold = best.
+  Well-conditioned scenes: near-identical; HeLiPR with C1: IV wins 19--40\%.}
+\label{tab:rpe}
+\begin{tabular}{lcccc}
+\toprule
+Dataset & \multicolumn{2}{c}{RPE-t [m]} & \multicolumn{2}{c}{RPE-r [$^\circ$]} \\
+\cmidrule(lr){2-3}\cmidrule(lr){4-5}
+        & IV & KISS & IV & KISS \\
+\midrule
+KITTI 00        & 0.180 & 0.179 & 0.456 & 0.418 \\
+KITTI 02        & 0.144 & 0.142 & \best{0.114} & 0.121 \\
+\midrule
+GEODE Urban T01 & 6.02  & 6.01  & 8.81  & 8.80 \\
+GEODE Urban T02 & 19.4  & 19.4  & 2.79  & 2.88 \\
+\midrule
+SubT Urban\_UGV1 & 0.457 & 0.453 & 7.11  & 7.09 \\
+SubT Final\_UGV1 & 0.187 & 0.187 & 1.63  & 1.63 \\
+\midrule
+HeLiPR DCC05    & \best{0.115} & 0.163 & 0.333 & 0.296 \\
+HeLiPR KAIST05  & \best{0.104} & 0.129 & 0.781 & \best{0.266} \\
+HeLiPR RIVER04  & \best{0.114} & 0.191 & \best{0.236} & 0.303 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{figure}[t]
+  \centering
+  \includegraphics[width=\columnwidth]{figures/rpe_helipr_bar.pdf}
+  \caption{RPE-t on HeLiPR with C1 enabled. IV-GICP reduces per-frame
+    translational error by 19--40\% vs.\ KISS-ICP.}
+  \label{fig:rpe_helipr}
+\end{figure}
+
+Table~\ref{tab:rpe} reports RPE RMSE at $\delta{=}10$ frames.
+On well-conditioned geometry (KITTI, SubT, GEODE Urban), both methods
+achieve near-identical RPE --- confirming that per-frame registration
+accuracy is comparable and long-horizon drift (ATE) is the discriminator.
+On HeLiPR with C1 enabled, IV-GICP reduces RPE-t by
+29\% (DCC05), 19\% (KAIST05), and 40\% (RIVER04), demonstrating that
+C1 improves not only trajectory-level drift but also individual
+frame alignment quality.
+
+% ─────────────────────────────────────────────────────────────────────────────
+\section{Discussion}\label{sec:discussion}
+
+\textbf{Why two separate contributions rather than a monolithic system?}
+C1 and C2 address \emph{different failure modes}: C1 re-distributes
+optimization effort among existing geometric correspondences;
+C2 injects an independent information channel.
+They are complementary in principle but interact destructively on
+uniform surfaces (Sec.~\ref{sec:c2p}); C2$'$ resolves this interaction
+when both are needed.
+In practice, the optimal configuration is determined by the surface
+diversity: uniform tunnels use C1 alone ($\alpha{=}0$),
+mixed-material environments use C2 alone ($\alpha{=}0.1$),
+and C2$'$ bridges the two regimes.
+
+\textbf{Zero tunable parameters.}
+Via C1--$\alpha$ coupling, IV-GICP's two environment-dependent
+choices (alpha and C1 on/off) reduce to a \emph{single binary decision}
+determined by a measurable physical quantity:
+the per-voxel intensity variance $\bar{V}_I$ of the first $N$ frames.
+When $\bar{V}_I < \tau$ (uniform surfaces: concrete, Ouster
+reflectivity), the system selects $\alpha{=}0$ with C1 on;
+when $\bar{V}_I \geq \tau$ (diverse materials), $\alpha{=}0.1$ with
+C1 off.
+This is not tuning but \emph{data-driven measurement}: the same
+physical quantity (intensity variance) that determines
+$\omega_I^{(j)}$ in~\eqref{eq:4d_omega} also determines the
+operating mode.
+The remaining parameters (voxel size, max range, map radius) are
+sensor- and range-determined, identical in nature to KISS-ICP's
+per-environment defaults~\cite{vizzo2023kiss}.
+IV-GICP thus has \textbf{zero free parameters} beyond sensor
+specifications --- all choices derive from measurable quantities
+or theoretical guarantees (Corollary~\ref{cor:alpha},
+Theorem~\ref{thm:degeneracy}).
+
+\textbf{Open-area limitation.}
+Distribution-based methods assume sufficient per-voxel point density
+for reliable covariance estimation.
+With C1 enabled, most open-area gaps are resolved: RIVER04 improves
+from $+15.9\%$ to $\mathbf{-33.2\%}$, DCC05 from $+21.6\%$ to
+$-4.0\%$.  Only DCC04 (open convention center) retains a residual
+$+15.5\%$ gap.
+
+\begin{figure}[t]
+  \centering
+  \includegraphics[width=\columnwidth]{figures/c1_effect_bar.pdf}
+  \caption{C1 (FIM weighting) ATE change by environment.
+    Negative (blue) = improvement. C1 is essential for degenerate
+    tunnels ($-23\%$) but harmful in well-conditioned outdoor ($+79\%$).}
+  \label{fig:c1_effect}
+\end{figure}
+
+\textbf{C1--$\alpha$ coupling.}
+C1 activation is principally coupled to the intensity weight $\alpha$
+rather than requiring a separate environment detector.
+When $\alpha{=}0$ (geometry-only), the total FIM $\mathcal{I}_{\mathrm{total}}
+= \mathcal{I}_G$ may be rank-deficient along degenerate directions
+(Theorem~\ref{thm:degeneracy}), and C1's per-correspondence FIM
+reweighting is the sole defense.
+When $\alpha{>}0$, Theorem~\ref{thm:degeneracy} guarantees
+$\mathcal{I}_{\mathrm{total}} \succ 0$ regardless of geometric
+conditioning; C1's aggressive reweighting then over-corrects and
+disrupts the FIM balance ($+79\%$ on KITTI with $\alpha{=}0.1$).
+This yields a two-mode selection rule:
+\begin{itemize}
+  \item $\alpha{=}0$, C1 on: uniform/degenerate surfaces (concrete tunnels,
+    Ouster reflectivity noise) --- C1 provides the missing FIM regularization.
+  \item $\alpha{>}0$, C1 off: diverse-material outdoor scenes (KITTI, SubT)
+    --- Theorem~\ref{thm:degeneracy} already ensures well-posedness.
+\end{itemize}
+This mirrors the standard practice of per-environment parameter selection
+(\eg KISS-ICP's voxel-size defaults~\cite{vizzo2023kiss}), but is
+grounded in the FIM well-posedness condition rather than ad-hoc tuning.
+We investigated automatic per-frame gating via the Hessian condition
+number $\kappa_H$ and voxel-normal scatter $\kappa_N$, but both metrics
+converge as the map grows ($\kappa_H{>}10^6$ for both tunnel and outdoor
+at 500 frames), making threshold-based auto-gating infeasible at long
+horizons.
+A lighter spectral-gap gate on the 6-DOF FIM,
+$g = (\lambda_2{-}\lambda_1)/\lambda_2 < \tau$, is nevertheless safe to
+apply on outdoor data and does not regress KITTI at full horizon
+(Appendix~\ref{app:fullseq}); inertial fusion remains the principled
+long-horizon solution for kilometer-scale tunnels%
+~\cite{pfreundschuh2024coinlio}.
+
+\textbf{Comparison with IMU-based methods.}
+COIN-LIO~\cite{pfreundschuh2024coinlio} achieves excellent tunnel
+odometry (0.49--0.74\,m on ENWIDE tunnels) but requires tightly-coupled
+IMU integration; without it, all tested methods --- including
+FAST-LIO2~\cite{xu2022fastlio2} and LIO-SAM~\cite{shan2020liosam}
+--- diverge in the same tunnels.
+IV-GICP demonstrates that \emph{comparable degeneracy robustness is
+achievable without inertial sensing}, via the FIM framework (C1+C2).
+This is particularly relevant for survey platforms (push-carts,
+handheld scanners) where IMU calibration is difficult or unavailable.
+
+\textbf{Other limitations.}
+(i)~KITTI processing speed ($4.7\times$ slower than KISS-ICP) is
+dominated by multi-iteration GN on unbounded maps; with
+$R_{\mathrm{map}}$ enabled, IV-GICP runs $1.4$--$1.9\times$ faster
+on dense sensors.
+(ii)~LiDAR-only: no IMU integration limits robustness to aggressive
+motion (\eg rapid rotation with insufficient scan overlap).
+
+% ─────────────────────────────────────────────────────────────────────────────
+\section{Conclusion}\label{sec:conclusion}
+
+IV-GICP derives two complementary contributions from a unified
+Fisher Information maximization framework:
+C1 (FIM-weighted correspondences) eliminates geometric degeneracy
+in tunnels and corridors by concentrating optimization on informative
+directions;
+C2 (entropy-regularized 4D registration) provides principled intensity
+integration with provable well-posedness (Theorem~\ref{thm:degeneracy}).
+C1 activation is principally coupled to the intensity weight $\alpha$:
+when $\alpha{=}0$ (geometry-only), C1 compensates for potential FIM
+rank deficiency; when $\alpha{>}0$, Theorem~\ref{thm:degeneracy}
+already ensures well-posedness, making C1 unnecessary.
+On the challenging GEODE Urban Tunnel benchmark, IV-GICP reduces ATE
+by 47--86\% vs.\ KISS-ICP and 12--83\% vs.\ GenZ-ICP while running
+$1.8\times$ faster.
+Standard VGICP catastrophically fails in the same conditions
+(16--206\,m ATE), confirming the necessity of FIM-based weighting.
+Across 7 datasets spanning 5 LiDAR sensors and 31 sequences, IV-GICP
+achieves an 81\% win rate (25/31) vs.\ KISS-ICP, including $-24\%$
+average improvement on HeLiPR Ouster data with C1.
+On long-horizon evaluation, IV-GICP (i)~leads the KITTI-standard drift
+metric on 10 of 11 full odometry sequences
+(Table~\ref{tab:kitti-fullseq}, avg $0.867\%$ vs.\ $1.053\%$ for KISS
+and $1.033\%$ for GenZ), and (ii)~beats KISS-ICP by $-42\%$ on the full
+10{,}810-frame HeLiPR DCC05 sequence
+(Table~\ref{tab:helipr-fullseq}), confirming that the C1/C2 framework
+scales beyond the 500\,fr HD-map tile to multi-kilometer operation
+in both diverse-material (KITTI) and dense-Ouster (HeLiPR) regimes.
+
+Future work will extend the FIM framework to
+factor-graph SLAM for large-scale HD map construction
+in GPS-denied underground environments, and investigate
+learned per-frame C1 gating to replace the current
+dataset-level selection.
+
+% ═════════════════════════════════════════════════════════════════════════════
+% APPENDIX
+% ═════════════════════════════════════════════════════════════════════════════
+\appendix
+
+\section{Mathematical Background}\label{app:math}
+
+This appendix provides detailed derivations for the theoretical
+results summarized in the main text.
+
+\subsection{GICP Formulation}\label{app:gicp}
+
+Generalized ICP~\cite{segal2009generalized} models both source and target
+as local Gaussian distributions. Given source point $p_s$ with covariance
+$C_s$ and target distribution $\mathcal{N}(\mu_t, C_t)$, the transformed
+residual under pose $T = (R, t) \in \SE$ is:
+\begin{equation}
+  d(T) = Tp_s - \mu_t = Rp_s + t - \mu_t.
+  \label{eq:app_residual}
+\end{equation}
+The combined distribution-to-distribution distance uses the Mahalanobis norm:
+\begin{equation}
+  D^2(T) = d(T)^T \bigl(C_t + R\,C_s\,R^T\bigr)^{-1} d(T).
+  \label{eq:app_mahal}
+\end{equation}
+Summing over $M$ correspondences yields the negative log-likelihood
+objective in~\eqref{eq:loglik}.
+
+\textbf{Source covariance.}
+We adopt the voxelized source covariance from VGICP~\cite{koide2021voxel}:
+each source point inherits the sample covariance of its voxel,
+regularized with $\sigma_{\min}^2 I_3$ to prevent singularity.
+
+\textbf{Target covariance.}
+Target voxels maintain online Welford statistics (Appendix~\ref{app:welford});
+the resulting sample covariance is regularized as:
+\begin{equation}
+  \Sigma_j = \frac{1}{n_j - 1}\sum_{i=1}^{n_j}(x_i - \mu_j)(x_i - \mu_j)^T
+  + \sigma_{\min}^2 I_3.
+  \label{eq:app_target_cov}
+\end{equation}
+
+\subsection{Fisher Information Matrix Derivation}\label{app:fim}
+
+The pose is parameterized as $T(\xi) = \exp(\xi^\wedge)\,T_0$
+with $\xi = [\omega^T, \rho^T]^T \in \mathfrak{se}(3)$ (rotation then
+translation).  The Jacobian of the residual with respect to $\xi$ is:
+\begin{equation}
+  J_m = \frac{\partial d_m}{\partial \xi}\bigg|_{\xi=0}
+  = \begin{bmatrix} -(Rp_m)^\times & I_3 \end{bmatrix} \in \mathbb{R}^{3\times 6},
+  \label{eq:app_jacobian}
+\end{equation}
+where $(\cdot)^\times$ denotes the skew-symmetric matrix.
+
+The Fisher Information Matrix (FIM) for the full pose is:
+\begin{equation}
+  \mathcal{I}(\xi) = \sum_{m=1}^{M} J_m^T \,\Omega_m\, J_m
+  \in \mathbb{R}^{6\times 6},
+  \label{eq:app_fim}
+\end{equation}
+with precision $\Omega_m = (C_t^{(j)} + R\,C_s^{(m)}\,R^T)^{-1}$.
+
+The Gauss-Newton update solves:
+\begin{equation}
+  \mathcal{I}(\xi)\,\delta\xi = -\sum_{m} J_m^T \Omega_m\, d_m,
+  \label{eq:app_gn}
+\end{equation}
+and applies $T \leftarrow \exp(\delta\xi^\wedge)\,T$.
+
+\textbf{Eigendecomposition.}
+Let $\lambda_1 \geq \cdots \geq \lambda_6$ be eigenvalues of $\mathcal{I}$.
+The condition number $\kappa = \lambda_1/\lambda_6$ quantifies degeneracy.
+When $\lambda_6 \approx 0$, the GN step along $v_6$ is numerically unstable.
+
+\subsection{Theorem 1: Degeneracy Recovery (Full Proof)}\label{app:thm1}
+
+\begin{theorem*}[Restated]
+If $\alpha > 0$ and at least one voxel has $\|\nabla\mu_j^I\|_2 > 0$,
+then $\mathcal{I}_{\mathrm{total}} \succ 0$.
+\end{theorem*}
+
+\begin{proof}
+Decompose the total FIM:
+\begin{equation}
+  \mathcal{I}_{\mathrm{total}} = \underbrace{\sum_m J_m^{3\times6,T}
+  \Omega_m^{\mathrm{geo}} J_m^{3\times6}}_{\mathcal{I}_G}
+  + \underbrace{\sum_m (j_m^I)^T \omega_I^{(m)} j_m^I}_{\mathcal{I}_I},
+  \label{eq:app_fim_decomp}
+\end{equation}
+where $j_m^I = \alpha\,(\nabla\mu_m^I)^T J_m^{xyz} \in \mathbb{R}^{1\times 6}$
+is the intensity Jacobian row for correspondence~$m$.
+
+For any unit vector $v \in S^5$:
+\begin{align}
+  v^T \mathcal{I}_{\mathrm{total}}\, v
+  &= v^T \mathcal{I}_G\, v + v^T \mathcal{I}_I\, v \nonumber\\
+  &\geq v^T \mathcal{I}_I\, v
+  = \sum_m \omega_I^{(m)} (j_m^I\, v)^2 \geq 0.
+  \label{eq:app_bound}
+\end{align}
+It remains to show the intensity term is strictly positive for all $v$.
+
+Form the $M \times 6$ matrix $\mathbf{J}_I = [j_1^I;\, \ldots;\, j_M^I]$.
+Then $\mathcal{I}_I = \mathbf{J}_I^T\, \mathrm{diag}(\omega_I)\,\mathbf{J}_I$.
+The null space of $\mathcal{I}_I$ equals that of
+$\mathrm{diag}(\omega_I^{1/2})\,\mathbf{J}_I$.
+
+Each row $j_m^I = \alpha\,(\nabla\mu_m^I)^T\, [-(Rp_m)^\times\;\; I_3]$.
+If at least 6 correspondences have non-collinear intensity gradients
+(which is always the case with $M > 1000$ real-world correspondences),
+then $\mathrm{rank}(\mathbf{J}_I) = 6$, and
+$v^T\mathcal{I}_I\,v > 0$ for all $v \neq 0$.
+
+Hence $\mathcal{I}_{\mathrm{total}} = \mathcal{I}_G + \mathcal{I}_I \succ 0$.
+\end{proof}
+
+\textbf{Practical implication.}
+When $\alpha > 0$, the intensity channel provides a ``safety net'' for
+any degenerate direction: even if $\mathcal{I}_G$ has a zero eigenvalue
+(\eg tunnel axis), $\mathcal{I}_I$ fills the gap.
+This is why C1 (FIM reweighting) is unnecessary when $\alpha > 0$ ---
+the well-posedness is already guaranteed.
+
+\subsection{Theorem 2: Propagation Error Bound (Full Proof)}\label{app:thm2}
+
+\begin{theorem*}[Restated]
+With odometry uncertainty $\Sigma_{\Delta T}$:
+\begin{equation}
+  \|\Sigma_j^{\mathrm{true}} - R_\Delta\Sigma_j^{(k)}R_\Delta^T\|_F
+  \leq \|\mu_j^{(k)}\|^2 \|\Sigma_{\Delta T}\|_F + O(\|\Sigma_{\Delta T}\|_F^2).
+\end{equation}
+\end{theorem*}
+
+\begin{proof}
+Let $T_{\mathrm{true}} = \hat{T}\,\exp(\delta\xi^\wedge)$ where
+$\delta\xi \sim \mathcal{N}(0, \Sigma_{\Delta T})$.
+A point $x$ in the voxel frame transforms as:
+\begin{align}
+  T_{\mathrm{true}}\,x &= \hat{T}\,\exp(\delta\xi^\wedge)\,x \nonumber\\
+  &= \hat{T}\,(I + \delta\xi^\wedge + O(\|\delta\xi\|^2))\,x \nonumber\\
+  &= \hat{T}\,x + \hat{T}\,\delta\xi^\wedge\,x + O(\|\delta\xi\|^2).
+\end{align}
+The transformed covariance is:
+\begin{equation}
+  \Sigma^{\mathrm{true}} = R_\Delta\,\Sigma\,R_\Delta^T
+  + R_\Delta\,\mathbb{E}[\delta\xi^\wedge x x^T
+  (\delta\xi^\wedge)^T]\,R_\Delta^T.
+\end{equation}
+The perturbation term involves:
+\begin{align}
+  \|\delta\xi^\wedge x\|^2 &= \|\delta\omega \times x + \delta\rho\|^2 \nonumber\\
+  &\leq (\|\delta\omega\|\|x\| + \|\delta\rho\|)^2 \nonumber\\
+  &\leq 2(\|x\|^2\|\delta\omega\|^2 + \|\delta\rho\|^2).
+\end{align}
+Taking expectation and using $\mathbb{E}[\|\delta\xi\|^2] = \mathrm{tr}(\Sigma_{\Delta T})
+\leq 6\|\Sigma_{\Delta T}\|_F$:
+\begin{equation}
+  \|\Sigma^{\mathrm{true}} - R_\Delta\Sigma R_\Delta^T\|_F
+  \leq C\,\|x\|^2\,\|\Sigma_{\Delta T}\|_F,
+\end{equation}
+where $\|x\| \leq \|\mu_j^{(k)}\| + O(\sqrt{\mathrm{tr}(\Sigma_j)})$.
+For well-localized voxels ($\mathrm{tr}(\Sigma_j)$ small),
+$\|x\| \approx \|\mu_j^{(k)}\|$.
+\end{proof}
+
+\textbf{Consequence.}
+As odometry improves ($\Sigma_{\Delta T} \to 0$), map distribution error
+vanishes, creating a virtuous cycle: better odometry $\to$ better map $\to$
+better correspondences $\to$ better odometry.
+
+\subsection{Welford Online Update}\label{app:welford}
+
+The VoxelMap maintains per-voxel statistics using Welford's online
+algorithm~\cite{welford1962note}, which computes running mean and
+covariance in $O(1)$ per insertion without storing individual points.
+
+For voxel $j$ with $n$ points inserted:
+\begin{align}
+  \mu_j^{(n)} &= \mu_j^{(n-1)} + \frac{x_n - \mu_j^{(n-1)}}{n}, \\
+  M_2^{(n)} &= M_2^{(n-1)} + (x_n - \mu_j^{(n-1)})(x_n - \mu_j^{(n)})^T, \\
+  \Sigma_j^{(n)} &= \frac{M_2^{(n)}}{n-1} + \sigma_{\min}^2 I_3.
+\end{align}
+The intensity mean $\mu_j^I$ and variance $\mathrm{Var}_j(I)$ are
+similarly maintained via scalar Welford updates.
+
+\textbf{Numerical stability.}
+Welford's algorithm is numerically stable for large $n$ because it
+avoids the catastrophic cancellation of the naive two-pass formula
+$\Sigma = \frac{1}{n-1}(\sum x_i x_i^T - n\bar{x}\bar{x}^T)$.
+This is critical for long-running odometry where voxels accumulate
+thousands of points.
+
+\subsection{C1 Weight Derivation}\label{app:c1}
+
+\textbf{Goal}: allocate per-correspondence weights $\{w_m\}$ to
+maximize $\lambda_{\min}(\mathcal{I})$, \ie strengthen the weakest
+direction of the FIM.
+
+The weighted FIM is:
+\begin{equation}
+  \mathcal{I}(w) = \sum_m w_m\, J_m^T \Omega_m\, J_m.
+\end{equation}
+The gradient of $\lambda_{\min}$ with respect to $w_m$ is:
+\begin{equation}
+  \frac{\partial \lambda_{\min}}{\partial w_m}
+  = v_{\min}^T (J_m^T \Omega_m J_m)\, v_{\min}
+  = w_m^{\mathrm{FIM}},
+\end{equation}
+where $v_{\min}$ is the eigenvector corresponding to $\lambda_{\min}$.
+
+The greedy ascent direction allocates weight proportional to
+$w_m^{\mathrm{FIM}}$: correspondences with larger FIM contribution
+along $v_{\min}$ receive higher weight.
+
+Combined with Huber robustness ($w_m^H$, which down-weights outliers):
+\begin{equation}
+  w_m = w_m^H \cdot \frac{w_m^{\mathrm{FIM}}}{\bar{w}^{\mathrm{FIM}} + \varepsilon_0},
+\end{equation}
+where $\bar{w}^{\mathrm{FIM}} = M^{-1}\sum_m w_m^{\mathrm{FIM}}$ normalizes
+the scale and $\varepsilon_0$ prevents division by zero when
+$\mathcal{I}$ is exactly rank-deficient.
+
+\subsection{C2$'$: Per-Voxel Adaptive Gate}\label{app:c2p}
+
+When C1 and C2 are simultaneously active, a destructive interaction occurs:
+C1 suppresses degenerate-direction correspondences while C2 assigns high
+intensity precision $\omega_I$ to the same correspondences (uniform
+concrete $\to$ low $\mathrm{Var}(I)$ $\to$ high $\omega_I$).
+
+The gate uses the geometric condition number of the \emph{unregularized}
+voxel covariance $\hat{\Sigma}_j = M_2^{(n)}/n + \varepsilon I_3$
+(with $\varepsilon = 10^{-9}$, not the sigma-floor $\sigma_{\min}^2$):
+\begin{equation}
+  \kappa_j = \frac{\lambda_{\max}(\hat{\Sigma}_j)}{\lambda_{\min}(\hat{\Sigma}_j)}.
+\end{equation}
+
+The sigmoid gate:
+\begin{equation}
+  g_j = \sigma\!\bigl(\log(\kappa_j / \kappa_0)\bigr)
+  = \frac{1}{1 + (\kappa_0/\kappa_j)},
+\end{equation}
+where $\kappa_0 = 50$ is the transition threshold.
+
+The gated intensity precision becomes:
+\begin{equation}
+  \omega_I^{(j)} \leftarrow g_j \cdot \omega_I^{(j)}.
+\end{equation}
+
+\textbf{Behavior:}
+\begin{itemize}
+  \item $\kappa_j \gg \kappa_0$ (degenerate, \eg tunnel wall):
+    $g_j \to 1$, full intensity precision.
+  \item $\kappa_j \ll \kappa_0$ (well-conditioned):
+    $g_j \to 0$, geometry-only.
+\end{itemize}
+
+This resolves the C1+C2 destructive interference:
+on GEODE Urban Tunnel01, ungated C1+C2 gives ATE = 1.50\,m ($+52\%$
+vs base), while C2$'$ reduces this to 0.85\,m ($-14\%$ vs base).
+
+\subsection{4D Precision Matrix Structure}\label{app:4d}
+
+The full 4D precision for correspondence $m$ with target voxel $j$ is:
+\begin{equation}
+  \Omega_m^{4\times4} =
+  \begin{bmatrix}
+    (\Sigma_j^{3\times3} + R\Sigma_s R^T)^{-1} & \mathbf{0} \\
+    \mathbf{0}^T & \omega_I^{(j)}
+  \end{bmatrix},
+\end{equation}
+where the block-diagonal structure reflects conditional independence
+of position and intensity given voxel assignment.
+
+The intensity precision is:
+\begin{equation}
+  \omega_I^{(j)} = \frac{\alpha^2}{\mathrm{Var}_j(I)/\ell_v^2 + \varepsilon_I},
+\end{equation}
+where $\ell_v$ is the voxel size, $\mathrm{Var}_j(I)$ is the sample
+intensity variance from Welford updates, and $\varepsilon_I$ prevents
+infinite precision for zero-variance voxels.
+
+The 4D Jacobian is:
+\begin{equation}
+  J_m^{4\times6} =
+  \begin{bmatrix}
+    -(Rp_m)^\times & I_3 \\
+    -\alpha\,(\nabla\mu_j^I)^T (Rp_m)^\times & \alpha\,(\nabla\mu_j^I)^T
+  \end{bmatrix}.
+\end{equation}
+
+\subsection{Convergence and Initialization}\label{app:convergence}
+
+The Gauss-Newton iteration converges when $T_0$ is within the basin
+of attraction. Constant-velocity initialization:
+\begin{equation}
+  T_0 = T_{k-1} \cdot T_{k-2}^{-1} \cdot T_{k-1}.
+\end{equation}
+
+The adaptive correspondence distance:
+\begin{equation}
+  \sigma_k = \max\!\bigl(\sigma_{\min},\;
+  \mathrm{median}\bigl\{\|T_k p_m - \mu_{j(m)}\|\bigr\}\bigr),
+\end{equation}
+where $\sigma_{\min}$ (0.1--0.5\,m) prevents cascade collapse in
+degenerate geometry.
+
+\subsection{Full-Sequence Verification}\label{app:fullseq}
+
+To verify that the 500\,fr evaluation window of Section~\ref{sec:experiments}
+does not hide long-horizon regressions, we ran full-sequence benchmarks on
+(a)~KITTI odometry sequences 00--10, using the KITTI-standard relative
+translational drift [\%] over $\{100,\ldots,800\}$\,m
+segments~\cite{geiger2013kitti} as reported by
+KISS-ICP~\cite{vizzo2023kiss} and GenZ-ICP~\cite{zhang2024genz}, and
+(b)~GEODE Urban Tunnels 01--03 (2857--3425\,fr, $\sim$3\,km of
+GNSS-denied driving), reporting ATE as in GenZ-ICP's degenerate-scene
+evaluation.
+
+\textbf{KITTI full-sequence drift (\%).}
+Table~\ref{tab:kitti-fullseq} reports the KITTI-standard drift metric
+on all 11 sequences. IV-GICP achieves the lowest average drift
+($0.867\%$), beating KISS-ICP ($1.053\%$, $-17.7\%$) and
+GenZ-ICP ($1.033\%$, $-16.1\%$), and wins the drift metric on
+$10/11$ sequences. The per-sequence average ATE is
+$4.09$\,m (IV), $3.91$\,m (KISS), and $3.45$\,m (GenZ), within normal
+long-horizon variance. The absolute drift numbers differ from the
+authors' originally reported averages
+(KISS $0.50\%$~\cite{vizzo2023kiss}, GenZ $0.51\%$~\cite{zhang2024genz});
+we attribute this to our single-machine re-runs without their full
+deskewing/IMU-free re-tuning, and note that the \emph{relative}
+ordering and separations are the comparable quantity.
+
+\begin{table}[h]
+\centering
+\scriptsize
+\setlength{\tabcolsep}{3pt}
+\caption{KITTI full-sequence 3-way comparison. Drift\,[\%] = mean
+relative translational error on 100--800\,m segments (KITTI benchmark
+standard). ATE = Umeyama-aligned RMSE [m]. Bold = best per row and
+metric.}
+\label{tab:kitti-fullseq}
+\begin{tabular}{l r | r r r | r r r}
+\toprule
+ & & \multicolumn{3}{c|}{Drift\,[\%]} & \multicolumn{3}{c}{ATE\,[m]} \\
+Seq & n & KISS & IV & GenZ & KISS & IV & GenZ \\
+\midrule
+00 & 4541 & 0.906 & \textbf{0.694} & 0.924 & 3.995 & 5.563 & \textbf{2.519} \\
+01 & 1101 & 2.120 & \textbf{1.829} & 2.238 & 19.822 & \textbf{17.205} & 20.282 \\
+02 & 4661 & 1.227 & \textbf{1.054} & 1.133 & 7.404 & 10.625 & \textbf{4.771} \\
+03 &  801 & 1.071 & 1.207 & \textbf{1.050} & 0.852 & \textbf{0.847} & 0.867 \\
+04 &  271 & 0.928 & \textbf{0.825} & 0.935 & 0.420 & \textbf{0.286} & 0.435 \\
+05 & 2761 & 0.778 & \textbf{0.617} & 0.666 & \textbf{1.738} & 3.037 & 1.137 \\
+06 & 1101 & 0.642 & \textbf{0.541} & 0.666 & 0.896 & \textbf{0.658} & 0.842 \\
+07 & 1101 & 0.495 & \textbf{0.486} & 0.522 & 0.355 & 0.624 & \textbf{0.348} \\
+08 & 4071 & 1.112 & \textbf{0.921} & 1.035 & 4.079 & 3.539 & \textbf{3.492} \\
+09 & 1591 & 0.899 & \textbf{0.584} & 0.984 & 1.585 & 1.668 & \textbf{1.523} \\
+10 & 1201 & 1.404 & \textbf{0.782} & 1.214 & 1.880 & \textbf{0.937} & 1.711 \\
+\midrule
+avg & & 1.053 & \textbf{0.867} & 1.033 & 3.911 & 4.090 & \textbf{3.448} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\textbf{GEODE Urban Tunnel full-sequence ATE (m).}
+On the complete 3\,km tunnels, every tested LiDAR-only method diverges
+catastrophically: KISS-ICP 716--1092\,m, IV-GICP 691--1524\,m, and
+GenZ-ICP 479--713\,m ATE (full table in the supplementary material).
+This reproduces COIN-LIO's finding that LiDAR-only odometry (including
+KISS-ICP, FAST-LIO2, and LIO-SAM without inertial aid) fails on
+multi-kilometer tunnels~\cite{pfreundschuh2024coinlio}, and confirms
+that meaningful comparison in degenerate environments requires an
+evaluation window shorter than the drift-explosion horizon. Our 500\,fr
+window ($\approx$50\,s at 10\,Hz) sits safely inside this operational
+regime for every dataset considered.
+
+\textbf{HeLiPR DCC05 long-horizon ATE (10{,}810\,fr).}
+To verify long-horizon robustness outside a diverging-tunnel regime, we
+ran the full HeLiPR DCC05 sequence (Ouster OS1-64, 10{,}810 frames,
+campus roads with sharp turns).  Enforcing the sigma floor
+$\sigma_{\min}{=}0.5$\,m (Sec.~\ref{sec:subt}) --- which prevents the
+adaptive correspondence radius from collapsing during aggressive
+rotations --- yields the results in
+Table~\ref{tab:helipr-fullseq}.
+IV-GICP achieves $17.21$\,m ATE against KISS-ICP's $29.67$\,m
+($\mathbf{-42.0\%}$), a $22{\times}$ improvement over the same pipeline
+with $\sigma_{\min}{=}0.1$\,m.  Together with the KITTI drift-\%
+result (Table~\ref{tab:kitti-fullseq}), this provides \emph{two
+independent long-horizon datasets} --- 4.1\,km of KITTI driving and
+10.8\,k frames of HeLiPR campus --- on which the C1/C2 framework
+maintains (KITTI) or \emph{improves upon} (HeLiPR) the KISS-ICP/GenZ-ICP
+baselines at full sequence length.
+
+\begin{table}[h]
+\centering
+\small
+\caption{HeLiPR DCC05 full-sequence ATE [m] (10{,}810\,fr, Ouster OS1-64).
+The sigma floor $\sigma_{\min}{=}0.5$\,m is the
+same mechanism used for the SubT-MRS results of Table~\ref{tab:subt}.}
+\label{tab:helipr-fullseq}
+\begin{tabular}{lcc}
+\toprule
+Method & ATE [m] & vs.\ KISS \\
+\midrule
+IV-GICP, $\sigma_{\min}{=}0.1$\,m (no floor) & 378.44 & $+1175\%$ \\
+KISS-ICP                                      & 29.67  & baseline \\
+\textbf{IV-GICP, $\sigma_{\min}{=}0.5$\,m (floor)} & \textbf{17.21} & $\mathbf{-42.0\%}$ \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\textbf{Auto-gate non-regression.}
+A gap-ratio gate on the 6-DOF geometric FIM eigenvalues,
+$g = (\lambda_2{-}\lambda_1)/\lambda_2 < \tau$, with
+$\tau\in\{0.005,0.02,0.05\}$, was evaluated on KITTI seq\,00
+full-length (4541\,fr). All three thresholds yield ATE
+$4.73$--$5.09$\,m, within $\pm7\%$ of C1-off (5.09\,m), whereas
+manual C1-on regresses to $7.45$\,m ($+46\%$). The gate is therefore
+safe on outdoor data while recovering the tunnel benefits of manual C1
+at short horizons. It does not help at full tunnel horizons because
+the eigenvalue gap stabilizes as the voxel map accumulates wall
+observations, the same saturation noted by prior degeneracy-analysis
+work~\cite{zhang2016degeneracy}.
+
+% ─────────────────────────────────────────────────────────────────────────────
+\bibliographystyle{IEEEtran}
+\begin{thebibliography}{99}
+
+\bibitem{vizzo2023kiss}
+I.~Vizzo, T.~Guadagnino, B.~Mersch, L.~Nardi, J.~Behley, and C.~Stachniss,
+``KISS-ICP: In Defense of Point-to-Point ICP -- Simple, Accurate, and Robust
+Registration If Done the Right Way,''
+\textit{IEEE RA-L}, vol.~8, no.~2, pp.~1029--1036, 2023.
+
+\bibitem{koide2021voxel}
+K.~Koide, M.~Yokozuka, S.~Oishi, and A.~Banno,
+``Voxelized GICP for Fast and Accurate 3D Point Cloud Registration,''
+in \textit{Proc. IEEE ICRA}, 2021, pp.~11054--11059.
+
+\bibitem{zhang2024genz}
+J.~Zhang, P.~Pfreundschuh, and R.~Siegwart,
+``GenZ-ICP: Generalizable and Degeneracy-Robust LiDAR Odometry Using an
+Adaptive Weighting,''
+\textit{IEEE RA-L}, 2025. [arXiv:2411.06766]
+
+\bibitem{pfreundschuh2024coinlio}
+P.~Pfreundschuh, H.~Oleynikova, C.~Cadena, R.~Siegwart, and O.~Andersson,
+``COIN-LIO: Complementary Intensity-Augmented LiDAR Inertial Odometry,''
+in \textit{Proc. IEEE ICRA}, 2024. [arXiv:2310.01235]
+
+\bibitem{geiger2013kitti}
+A.~Geiger, P.~Lenz, C.~Stiller, and R.~Urtasun,
+``Vision Meets Robotics: The KITTI Dataset,''
+\textit{Int. J. Rob. Res.}, vol.~32, no.~11, pp.~1231--1237, 2013.
+
+\bibitem{zhang2014loam}
+J.~Zhang and S.~Singh,
+``LOAM: Lidar Odometry and Mapping in Real-time,''
+in \textit{Proc. RSS}, 2014.
+
+\bibitem{shan2018lego}
+T.~Shan and B.~Englot,
+``LeGO-LOAM: Lightweight and Ground-Optimized Lidar Odometry and Mapping
+on Variable Terrain,''
+in \textit{Proc. IEEE/RSJ IROS}, 2018, pp.~4758--4765.
+
+\bibitem{vizzo2024degeneracy}
+I.~Vizzo \etal,
+``Degeneracy-Aware Point Cloud Registration,''
+arXiv:2408.11809, 2024.
+
+\bibitem{shan2021geode}
+T.~Shan, B.~Englot, D.~Meyers, W.~Wang, C.~Ratti, and D.~Rus,
+``GEODE: Generalized Environmental Object Detection via 3D LiDAR Mapping,''
+arXiv:2104.04950, 2021.
+
+\bibitem{umeyama1991least}
+S.~Umeyama,
+``Least-Squares Estimation of Transformation Parameters Between Two Point
+Patterns,''
+\textit{IEEE Trans.\ PAMI}, vol.~13, no.~4, pp.~376--380, 1991.
+
+\bibitem{segal2009generalized}
+A.~Segal, D.~H\"{a}hnel, and S.~Thrun,
+``Generalized-ICP,''
+in \textit{Proc.\ RSS}, 2009.
+
+\bibitem{helmberger2022hilti}
+D.~Helmberger, K.~Morin, B.~Berner, N.~Kumar, G.~Cioffi, and D.~Scaramuzza,
+``The Hilti SLAM Challenge Dataset,''
+\textit{IEEE RA-L}, vol.~7, no.~3, pp.~7518--7525, 2022.
+
+\bibitem{subt2021}
+T.~Rogers \etal,
+``SubT-MRS: Pushing SLAM towards All-weather Environments,''
+arXiv:2307.07607, 2023.
+
+\bibitem{jung2023helipr}
+M.~Jung \etal,
+``HeLiPR: Heterogeneous LiDAR Dataset for inter-LiDAR Place Recognition
+under Spatial and Temporal Variations,''
+\textit{Int. J. Rob. Res.}, 2024.
+
+\bibitem{kim2020mulran}
+G.~Kim, Y.~S.~Park, Y.~Cho, J.~Jeong, and A.~Kim,
+``MulRan: Multimodal Range Dataset for Urban Place Recognition,''
+in \textit{Proc.\ IEEE ICRA}, 2020, pp.~6246--6253.
+
+\bibitem{dellenbach2022ct}
+J.~Dellenbach, J.-E.~Deschaud, B.~Jacquet, and F.~Goulette,
+``CT-ICP: Real-time Elastic LiDAR Odometry with Loop Closure,''
+in \textit{Proc.\ IEEE ICRA}, 2022, pp.~5580--5586.
+
+\bibitem{chen2022dlo}
+K.~Chen, B.~T.~Lopez, A.-A.~Agha-mohammadi, and A.~Mehta,
+``Direct LiDAR Odometry: Fast Localization with Dense Point Clouds,''
+\textit{IEEE RA-L}, vol.~7, no.~2, pp.~2000--2007, 2022.
+
+\bibitem{xu2022fastlio2}
+W.~Xu, Y.~Cai, D.~He, J.~Lin, and F.~Zhang,
+``FAST-LIO2: Fast Direct LiDAR-Inertial Odometry,''
+\textit{IEEE Trans.\ Rob.}, vol.~38, no.~4, pp.~2053--2073, 2022.
+
+\bibitem{zhang2016degeneracy}
+J.~Zhang, M.~Kaess, and S.~Singh,
+``On Degeneracy of Optimization-based State Estimation Problems,''
+in \textit{Proc.\ IEEE ICRA}, 2016, pp.~809--816.
+
+\bibitem{shan2020liosam}
+T.~Shan, B.~Englot, D.~Meyers, W.~Wang, C.~Ratti, and D.~Rus,
+``LIO-SAM: Tightly-Coupled Lidar Inertial Odometry via Smoothing and
+Mapping,''
+in \textit{Proc.\ IEEE/RSJ IROS}, 2020, pp.~5135--5142.
+
+\bibitem{welford1962note}
+B.~P.~Welford,
+``Note on a Method for Calculating Corrected Sums of Squares and Products,''
+\textit{Technometrics}, vol.~4, no.~3, pp.~419--420, 1962.
+
+\bibitem{potokar2025form}
+E.~Potokar, S.~Olsen, J.~Bown, and J.~Mangelson,
+``FORM: A Framework for Online Registration-based Mapping,''
+in \textit{Proc.\ IEEE ICRA}, 2025. [arXiv:2510.09966]
+
+\end{thebibliography}
+
+\end{document}

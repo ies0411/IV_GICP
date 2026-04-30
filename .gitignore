@@ -11,3 +11,5 @@ thirdparty/
 results/
 figures/
 .pytest_cache/
+output/
+results/

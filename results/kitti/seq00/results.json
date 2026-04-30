@@ -4,33 +4,43 @@
   "iv_sparse_mode": null,
   "methods": {
     "KISS-ICP": {
-      "ate_rmse": 0.3203180326339359,
-      "ate_mean": 0.27972181346077374,
-      "kitti_t_err": 113.4085432279556,
-      "mean_ms": 185.5272307470441,
+      "ate_rmse": 0.3203180326339311,
+      "ate_mean": 0.27972181346076425,
+      "kitti_t_err": 1.1503151023457514,
+      "rpe_trans": 0.17862721477751461,
+      "rpe_rot_deg": 0.41783733283629176,
+      "mean_ms": 144.69866238167742,
       "n_frames": 500,
       "device": "cpu"
     },
     "IV-GICP": {
-      "ate_rmse": 0.3134071895610187,
-      "ate_mean": 0.2724660867453908,
-      "kitti_t_err": 113.2708631721472,
-      "mean_ms": 209.9807333315019,
+      "ate_rmse": 0.38048385757815223,
+      "ate_mean": 0.3239754861677254,
+      "kitti_t_err": 1.1167600547301615,
+      "rpe_trans": 0.1786389384238922,
+      "rpe_rot_deg": 0.4395269009488209,
+      "mean_ms": 203.63735167685485,
       "n_frames": 500,
       "device": "cpu",
-      "reg_ms": 97.83601339062851,
-      "map_ms": 69.88344896297328,
+      "reg_ms": 102.33348052553741,
+      "map_ms": 64.644028384783,
       "sparse_mode": null
     },
     "GenZ-ICP": {
       "ate_rmse": 0.2782428761276653,
-      "n_frames": 500
+      "ate_mean": 0.24381363107358822,
+      "kitti_t_err": 1.0683447940852524,
+      "rpe_trans": 0.1807388827922619,
+      "rpe_rot_deg": 0.42502876488613817,
+      "mean_ms": NaN,
+      "n_frames": 500,
+      "device": "cpu"
     }
   },
   "speed_vs_kiss": {
-    "kiss_mean_ms": 185.8073845459055,
-    "iv_mean_ms": 209.9807333315019,
-    "ratio_iv_over_kiss": 1.1300989669741794,
+    "kiss_mean_ms": 144.65297025821792,
+    "iv_mean_ms": 203.63735167685485,
+    "ratio_iv_over_kiss": 1.407764744224365,
     "target_ratio_max": 1.5,
     "hard_cap_ratio": 2.0,
     "within_soft_budget": true,

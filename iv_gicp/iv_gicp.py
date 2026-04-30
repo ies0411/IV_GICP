@@ -309,6 +309,7 @@ class IVGICP:
         use_mscs: bool = False,
         mscs_kappa_max: float = 100.0,
         v_min_prev: Optional[np.ndarray] = None,
+        fim_auto_gate: float = 0.0,
     ) -> Tuple[np.ndarray, dict]:
         """
         Register source to pre-built target arrays (C++ fast path).
@@ -351,6 +352,7 @@ class IVGICP:
                 bool(use_mscs),
                 float(mscs_kappa_max),
                 v_prev,
+                float(fim_auto_gate),
             )
             info["iterations"] = result["iterations"]
             info["n_correspondences"] = result["n_valid"]
@@ -363,6 +365,10 @@ class IVGICP:
                 info["tree_build_ms"] = float(result["tree_build_ms"])
             if "gn_loop_ms" in result:
                 info["gn_loop_ms"] = float(result["gn_loop_ms"])
+            if "gap_ratio" in result:
+                info["gap_ratio"] = float(result["gap_ratio"])
+            if "c1_active_iters" in result:
+                info["c1_active_iters"] = int(result["c1_active_iters"])
             return result["T"], info
 
         result = _cpp_core.icp_register(
@@ -386,6 +392,7 @@ class IVGICP:
             bool(use_mscs),
             float(mscs_kappa_max),
             v_prev,
+            float(fim_auto_gate),
         )
         info["iterations"] = result["iterations"]
         info["n_correspondences"] = result["n_valid"]
@@ -398,6 +405,10 @@ class IVGICP:
             info["tree_build_ms"] = float(result["tree_build_ms"])
         if "gn_loop_ms" in result:
             info["gn_loop_ms"] = float(result["gn_loop_ms"])
+        if "gap_ratio" in result:
+            info["gap_ratio"] = float(result["gap_ratio"])
+        if "c1_active_iters" in result:
+            info["c1_active_iters"] = int(result["c1_active_iters"])
         return result["T"], info
 
     def _precompute_target_arrays(

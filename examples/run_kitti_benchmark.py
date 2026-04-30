@@ -35,6 +35,43 @@ KITTI_ROOT   = Path("/home/km/deepai_dev_data/kitti/dataset")
 GENZ_BINARY  = Path(__file__).parent.parent / "thirdparty/genz-icp/kitti_runner/build/genz_kitti_runner"
 RESULTS_ROOT = Path(__file__).parent.parent / "results" / "kitti"
 
+# KITTI velo-to-cam0 calibration (Tr, 3×4 row-major) per recording date.
+# Required for correct RPE: GT poses are in camera frame, odometry is in LiDAR frame.
+# P_gt_lidar[i] = Tr_inv @ P_gt_cam[i] @ Tr  (similarity transform to LiDAR frame).
+_KITTI_TR = {
+    # 2011_10_03: seq 00, 01, 02
+    "00": np.array([4.276802385584e-04, -9.999672484946e-01, -8.084491683471e-03, -1.198459927713e-02,
+                    -7.210626507497e-03,  8.081198471645e-03, -9.999413164504e-01, -5.403984729748e-02,
+                     9.999738645903e-01,  4.859485810390e-04, -7.206933692422e-03, -2.921968648686e-01]).reshape(3, 4),
+    # 2011_09_26: seq 03
+    "03": np.array([7.967514e-03, -9.999679e-01, -8.462264e-04, -1.377769e-02,
+                    -2.771053e-03,  7.646066e-04, -9.999958e-01, -5.542305e-02,
+                     9.999645e-01,  7.969825e-03, -2.764397e-03, -2.918589e-01]).reshape(3, 4),
+    # 2011_09_30: seq 04–10
+    "04": np.array([-1.857739e-03, -9.999659e-01, -8.039975e-03, -4.784029e-03,
+                    -6.481465e-03,  8.051860e-03, -9.999466e-01, -7.337429e-02,
+                     9.999773e-01, -1.805528e-03, -6.496203e-03, -3.339968e-01]).reshape(3, 4),
+}
+# Share calibration across sequences from same recording date
+for _s in ("01", "02"):
+    _KITTI_TR[_s] = _KITTI_TR["00"]
+for _s in ("05", "06", "07", "08", "09", "10"):
+    _KITTI_TR[_s] = _KITTI_TR["04"]
+
+
+def kitti_gt_to_lidar_frame(poses_cam, seq: str):
+    """Convert KITTI GT poses from camera frame to LiDAR frame using Tr calibration.
+
+    P_lidar[i] = Tr_inv @ P_cam[i] @ Tr
+    """
+    tr34 = _KITTI_TR.get(seq)
+    if tr34 is None:
+        return poses_cam  # no calibration → return unchanged
+    Tr = np.eye(4)
+    Tr[:3, :] = tr34
+    Tr_inv = np.linalg.inv(Tr)
+    return [Tr_inv @ P @ Tr for P in poses_cam]
+
 # IV-GICP vs KISS mean ms/frame: ≤1.5× acceptable; >2× is considered too slow for iterative tuning.
 SPEED_RATIO_SOFT = 1.5
 SPEED_RATIO_HARD = 2.0
@@ -163,6 +200,28 @@ def kitti_t_err(poses_est, poses_gt, step=10, lengths=(100,200,300,400,500,600,7
     return float(np.mean(t_errs)) if t_errs else float("nan")
 
 
+def rpe_rmse(poses_est, poses_gt, delta=10):
+    """Relative Pose Error (RPE) RMSE: translation and rotation over fixed frame delta.
+
+    Returns (rpe_trans_rmse, rpe_rot_rmse_deg).
+    """
+    n = min(len(poses_est), len(poses_gt))
+    t_errs, r_errs = [], []
+    for i in range(n - delta):
+        j = i + delta
+        T_est_rel = np.linalg.inv(poses_est[i]) @ poses_est[j]
+        T_gt_rel = np.linalg.inv(poses_gt[i]) @ poses_gt[j]
+        T_err = np.linalg.inv(T_gt_rel) @ T_est_rel
+        t_errs.append(np.linalg.norm(T_err[:3, 3]))
+        # Rotation error: angle from R_err
+        R_err = T_err[:3, :3]
+        cos_angle = np.clip((np.trace(R_err) - 1) / 2, -1, 1)
+        r_errs.append(np.degrees(np.arccos(cos_angle)))
+    if not t_errs:
+        return float("nan"), float("nan")
+    return float(np.sqrt(np.mean(np.array(t_errs)**2))), float(np.sqrt(np.mean(np.array(r_errs)**2)))
+
+
 def print_timing(name, times_ms):
     t = np.array(times_ms)
     print(f"  [{name}] mean={t.mean():.1f}ms  median={np.median(t):.1f}ms  "
@@ -180,7 +239,7 @@ def run_iv_gicp(frames, device, alpha, label, sparse_mode: Optional[str] = None,
         alpha=alpha,
         max_correspondence_distance=2.0,
         initial_threshold=2.0,
-        min_motion_th=0.1,
+        min_motion_th=0.5,  # 2026-04-20: 0.1→0.5 fixes full-seq catastrophic drift on turn-heavy seqs (seq02 250m→10m)
         max_map_points=100_000,
         max_map_frames=500,
         auto_alpha=False,
@@ -340,14 +399,20 @@ def main():
         poses_gt = poses_gt[:n]
     print(f"\n  {n} frames loaded  GT: {'yes' if poses_gt else 'no'}")
 
+    # Convert GT from camera frame to LiDAR frame for correct RPE/kitti_t_err.
+    # ATE uses Umeyama alignment (frame-invariant), so it works with either.
+    poses_gt_lidar = kitti_gt_to_lidar_frame(poses_gt, args.seq) if poses_gt else None
+
     results = {}
 
     # ── KISS-ICP ─────────────────────────────────────────────────────────────
     ki_poses, ki_times = run_kiss_icp(frames)
     ki_ate, ki_ate_m = ate_rmse(ki_poses, poses_gt) if poses_gt else (float("nan"), float("nan"))
-    ki_kt = kitti_t_err(ki_poses, poses_gt) if poses_gt else float("nan")
+    ki_kt = kitti_t_err(ki_poses, poses_gt_lidar) if poses_gt_lidar else float("nan")
+    ki_rpe_t, ki_rpe_r = rpe_rmse(ki_poses, poses_gt_lidar) if poses_gt_lidar else (float("nan"), float("nan"))
     results["KISS-ICP"] = dict(
         ate_rmse=ki_ate, ate_mean=ki_ate_m, kitti_t_err=ki_kt,
+        rpe_trans=ki_rpe_t, rpe_rot_deg=ki_rpe_r,
         mean_ms=float(np.mean(ki_times)), n_frames=n, device="cpu",
     )
 
@@ -367,9 +432,11 @@ def main():
         frames, device, alpha=0.1, label=iv_lab, sparse_mode=iv_sparse,
     )
     iv_ate, iv_ate_m = ate_rmse(iv_poses, poses_gt) if poses_gt else (float("nan"), float("nan"))
-    iv_kt = kitti_t_err(iv_poses, poses_gt) if poses_gt else float("nan")
+    iv_kt = kitti_t_err(iv_poses, poses_gt_lidar) if poses_gt_lidar else float("nan")
+    iv_rpe_t, iv_rpe_r = rpe_rmse(iv_poses, poses_gt_lidar) if poses_gt_lidar else (float("nan"), float("nan"))
     results[iv_key] = dict(
         ate_rmse=iv_ate, ate_mean=iv_ate_m, kitti_t_err=iv_kt,
+        rpe_trans=iv_rpe_t, rpe_rot_deg=iv_rpe_r,
         mean_ms=float(np.mean(iv_times[1:])), n_frames=n, device=device,
         reg_ms=float(np.mean(iv_reg[1:])), map_ms=float(np.mean(iv_map[1:])),
         sparse_mode=iv_sparse,
@@ -380,9 +447,11 @@ def main():
         gz_poses, _ = run_genz_icp(args.seq, args.max_frames, out)
         if gz_poses:
             gz_ate, gz_ate_m = ate_rmse(gz_poses, poses_gt) if poses_gt else (float("nan"), float("nan"))
-            gz_kt = kitti_t_err(gz_poses, poses_gt) if poses_gt else float("nan")
+            gz_kt = kitti_t_err(gz_poses, poses_gt_lidar) if poses_gt_lidar else float("nan")
+            gz_rpe_t, gz_rpe_r = rpe_rmse(gz_poses, poses_gt_lidar) if poses_gt_lidar else (float("nan"), float("nan"))
             results["GenZ-ICP"] = dict(
                 ate_rmse=gz_ate, ate_mean=gz_ate_m, kitti_t_err=gz_kt,
+                rpe_trans=gz_rpe_t, rpe_rot_deg=gz_rpe_r,
                 mean_ms=float("nan"), n_frames=len(gz_poses), device="cpu",
             )
 
@@ -390,16 +459,15 @@ def main():
     print(f"\n{'='*90}")
     print(f"  KITTI seq {args.seq}  |  {n} frames  |  GT: {'yes' if poses_gt else 'no'}")
     print(f"{'='*90}")
-    print(f"  {'Method':<20} {'ATE(m)':>8} {'KITTI-t%':>9} {'total ms':>9} "
-          f"{'reg ms':>8} {'map ms':>8} {'Hz':>6} {'Device':>7}")
-    print(f"  {'-'*83}")
+    print(f"  {'Method':<20} {'ATE(m)':>8} {'RPE-t(m)':>9} {'RPE-r(°)':>9} {'KITTI-t%':>9} "
+          f"{'ms/fr':>7} {'Hz':>6}")
+    print(f"  {'-'*73}")
     for name, r in results.items():
         hz = 1000 / r['mean_ms'] if r['mean_ms'] > 0 else float("nan")
-        reg = r.get('reg_ms', float("nan"))
-        mmap = r.get('map_ms', float("nan"))
-        print(f"  {name:<20} {r['ate_rmse']:>8.3f} {r['kitti_t_err']:>9.2f} "
-              f"{r['mean_ms']:>9.1f} {reg:>8.1f} {mmap:>8.1f} {hz:>6.1f} "
-              f"{r.get('device','?'):>7}")
+        rpe_t = r.get('rpe_trans', float("nan"))
+        rpe_r = r.get('rpe_rot_deg', float("nan"))
+        print(f"  {name:<20} {r['ate_rmse']:>8.3f} {rpe_t:>9.4f} {rpe_r:>9.4f} "
+              f"{r['kitti_t_err']:>9.2f} {r['mean_ms']:>7.1f} {hz:>6.1f}")
     print(f"{'='*90}")
 
     # Speed vs KISS (skip frame 0 for both — cold start)

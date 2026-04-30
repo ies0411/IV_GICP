@@ -127,7 +127,7 @@ class IVGICPPipeline:
         alpha_floor_ratio: float = 0.2,  # when κ > threshold, effective_alpha >= alpha_max * this (avoid too-weak intensity in degenerate)
         use_fim_weight: bool = False,
         use_entropy_alpha: bool = False,
-        entropy_scale_c: float = 0.5,  # scale = 1 + c * (h_geo - median(h_geo)), clipped [0.4, 2.5]; was 0.3 for stronger C3
+        entropy_scale_c: float = 50.0,  # C3-A kappa0: condition number threshold for per-voxel adaptive alpha; ~50 outdoor, ~20 tunnel
         # A.1 Well-posed polish: when κ_geo < threshold, refine with geometry-only 1–2 GN steps
         well_posed_polish: bool = False,
         well_posed_kappa_threshold: float = 100.0,
@@ -167,6 +167,16 @@ class IVGICPPipeline:
         # Derived from Theorem 1 well-posedness condition — no dataset-specific tuning.
         use_mscs: bool = False,
         mscs_kappa_max: float = 100.0,
+        # C1 auto-gate: automatically disable FIM weighting when Hessian κ < threshold.
+        # 0 = manual mode (use_fim_weight decides). Recommended: 100.0 (degenerate when κ≥100).
+        fim_auto_gate: float = 0.0,
+        # Auto-mode: measure per-voxel intensity variance from first N frames,
+        # then auto-select alpha and C1. True = zero free parameters mode.
+        # Low Var(I) → alpha=0, C1=True (uniform surface, tunnel)
+        # High Var(I) → alpha=0.1, C1=False (diverse materials, outdoor)
+        auto_mode: bool = False,
+        auto_mode_warmup: int = 10,       # frames to collect before deciding
+        auto_mode_var_threshold: float = 0.005,  # Var(I) threshold (normalized [0,1] intensity)
         # Voxel covariance regularization: adds (count_reg_scale²/n)·I to each voxel covariance.
         # Lower → tighter initial covariance → better correspondence quality for new voxels.
         # Default 2.0 (conservative); 1.0 improves early-frame accuracy.
@@ -238,7 +248,11 @@ class IVGICPPipeline:
             max_registration_target_voxels=max_registration_target_voxels,
             use_mscs=use_mscs,
             mscs_kappa_max=mscs_kappa_max,
+            fim_auto_gate=fim_auto_gate,
             count_reg_scale=count_reg_scale,
+            auto_mode=auto_mode,
+            auto_mode_warmup=auto_mode_warmup,
+            auto_mode_var_threshold=auto_mode_var_threshold,
         )
         # Explicit constructor args override config file
         _opts = {**_file_cfg, **_opts}
@@ -344,6 +358,7 @@ class IVGICPPipeline:
 
         self._use_mscs = bool(_opts.get("use_mscs", False))
         self._mscs_kappa_max = float(_opts.get("mscs_kappa_max", 100.0))
+        self._fim_auto_gate = float(_opts.get("fim_auto_gate", 0.0))
         self._prev_v_min: np.ndarray = np.zeros(6, dtype=np.float64)  # warm-start for MSCS
         self._count_reg_scale = float(_opts.get("count_reg_scale", 2.0))
 
@@ -419,6 +434,12 @@ class IVGICPPipeline:
         self._last_alpha_rebuild_frame: int = -1
         self._auto_alpha_rebuild_interval: int = self._kdtree_interval  # sync with kdtree rebuild
         self._auto_alpha_change_threshold: float = 0.05
+
+        # Auto-mode: zero free parameters via intensity variance measurement
+        self._auto_mode = bool(_opts.get("auto_mode", False))
+        self._auto_mode_warmup = int(_opts.get("auto_mode_warmup", 10))
+        self._auto_mode_var_threshold = float(_opts.get("auto_mode_var_threshold", 0.005))
+        self._auto_mode_decided = False  # True after warmup decision is made
 
     def _prefilter(
         self,
@@ -637,6 +658,29 @@ class IVGICPPipeline:
             self.trajectory.timestamps = [timestamp or 0.0]
             return OdometryResult(pose=np.eye(4), timestamp=timestamp, odometry_mode="iv")
 
+        # Auto-mode: after warmup frames, measure intensity variance and decide alpha/C1
+        if self._auto_mode and not self._auto_mode_decided and self._frame_count >= self._auto_mode_warmup:
+            try:
+                mean_var, n_voxels = self._cpp_voxel_map.get_mean_intensity_variance()
+                if n_voxels >= 10:
+                    if mean_var < self._auto_mode_var_threshold:
+                        # Uniform surface → alpha=0, C1=True
+                        self.iv_gicp.alpha = 0.0
+                        self.iv_gicp.use_fim_weight = True
+                        self._auto_mode_selected = "uniform"
+                    else:
+                        # Diverse materials → alpha=0.1, C1=False
+                        self.iv_gicp.alpha = 0.1
+                        self.iv_gicp.use_fim_weight = False
+                        self._auto_mode_selected = "diverse"
+                    self._auto_mode_decided = True
+                    self._build_voxels_from_cpp_map()  # rebuild with new alpha
+                    print(f"  [auto-mode] frame={self._frame_count}: mean_var={mean_var:.6f}, "
+                          f"n_voxels={n_voxels}, mode={self._auto_mode_selected} "
+                          f"→ alpha={self.iv_gicp.alpha}, C1={self.iv_gicp.use_fim_weight}")
+            except Exception:
+                pass  # fallback to manual params
+
         # Initial pose: constant-velocity prediction (unless overridden)
         if init_pose is None:
             init_pose = self._predict_initial_pose()
@@ -721,6 +765,7 @@ class IVGICPPipeline:
                 use_mscs=self._use_mscs,
                 mscs_kappa_max=self._mscs_kappa_max,
                 v_min_prev=self._prev_v_min,
+                fim_auto_gate=self._fim_auto_gate,
             )
         if _alpha_restore is not None:
             self.iv_gicp.alpha = _alpha_restore

@@ -142,7 +142,7 @@ def run_iv_gicp(frames, scan_ts, alpha, label, device, voxel_size=1.0,
         alpha=alpha,
         max_correspondence_distance=2.0,
         initial_threshold=2.0,
-        min_motion_th=0.1,
+        min_motion_th=0.5,            # 2026-04-21: 0.1→0.5 fixes DCC05 full-seq divergence (378m→17.21m, beats KISS -42%)
         max_iterations=20,            # 20 itr needed for convergence on dense Ouster scans
         max_map_frames=max_map_frames,
         map_radius=None,              # age-based eviction
@@ -207,6 +207,9 @@ def main():
     ap.add_argument("--voxel-size", type=float, default=1.0)
     ap.add_argument("--max-map-frames", type=int, default=20)  # small window for open-area sections
     ap.add_argument("--skip-kiss",  action="store_true")
+    ap.add_argument("--use-fim-weight", action="store_true", default=True,
+                    help="Enable C1 (FIM weighting). Helps 4/5 HeLiPR seqs.")
+    ap.add_argument("--no-fim-weight", dest="use_fim_weight", action="store_false")
     args = ap.parse_args()
 
     frames, gt_ts, gt_poses, scan_ts = load_sequence(args.seq, args.max_frames)
@@ -218,7 +221,8 @@ def main():
     # IV-GICP
     poses, _ = run_iv_gicp(frames, scan_ts, alpha=args.alpha, label=f"IV-GICP (α={args.alpha})",
                             device=args.device, voxel_size=args.voxel_size,
-                            max_map_frames=args.max_map_frames)
+                            max_map_frames=args.max_map_frames,
+                            use_fim_weight=args.use_fim_weight)
     ate = compute_ate(poses, scan_ts, gt_ts, gt_poses)
     results[f"iv_gicp_a{args.alpha}"] = ate
     print(f"  ATE RMSE: {ate:.4f}m")
